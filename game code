@@ -1,0 +1,1745 @@
+import copy
+import math
+from pathlib import Path
+import pygame
+
+PLAYER_SIZE = (32, 48)
+GRAVITY = 0.62
+JUMP_SPEED = -13
+MAX_FALL_SPEED = 14
+VINE_LENGTH = 135
+SCREEN_WIDTH = 900
+
+
+class Player:
+    def __init__(self, start):
+        self.rect = pygame.Rect(start[0], start[1], *PLAYER_SIZE)
+        self.vx = 0.0
+        self.vy = 0.0
+        self.facing = 1
+        self.blocking = False
+        self.on_ground = False
+        self.attached = False
+        self.swing_anchor = None
+        self.swing_angle = 0.0
+        self.swing_speed = 0.0
+
+    def respawn(self, start):
+        self.rect.topleft = start
+        self.vx = 0.0
+        self.vy = 0.0
+        self.facing = 1
+        self.blocking = False
+        self.on_ground = False
+        self.attached = False
+        self.swing_anchor = None
+        self.swing_speed = 0.0
+
+    def toggle_vine(self, vines):
+        if self.attached:
+            self.attached = False
+            self.swing_anchor = None
+            self.vx = math.cos(self.swing_angle) * VINE_LENGTH * self.swing_speed
+            self.vy = -math.sin(self.swing_angle) * VINE_LENGTH * self.swing_speed - 1
+            return
+
+        nearest_vine = None
+        nearest_distance = 185
+        for anchor in vines:
+            distance = math.hypot(self.rect.centerx - anchor[0], self.rect.centery - anchor[1])
+            if distance < nearest_distance:
+                nearest_vine = anchor
+                nearest_distance = distance
+
+        if nearest_vine is not None:
+            self.attached = True
+            self.swing_anchor = nearest_vine
+            dx = self.rect.centerx - nearest_vine[0]
+            dy = self.rect.centery - nearest_vine[1]
+            self.swing_angle = math.atan2(dx, dy)
+            self.swing_speed = 0.0
+
+    def update(self, dt, keys, platforms, theme):
+        frame = dt * 60
+        self.blocking = bool(keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT])
+
+        if self.attached:
+            direction = int(keys[pygame.K_d]) - int(keys[pygame.K_a])
+            if direction:
+                self.facing = direction
+            self.swing_speed += (
+                -GRAVITY / VINE_LENGTH * math.sin(self.swing_angle) + direction * 0.02
+            ) * frame
+            self.swing_speed *= 0.995 ** frame
+            self.swing_angle += self.swing_speed * frame
+            anchor_x, anchor_y = self.swing_anchor
+            self.rect.center = (
+                round(anchor_x + math.sin(self.swing_angle) * VINE_LENGTH),
+                round(anchor_y + math.cos(self.swing_angle) * VINE_LENGTH),
+            )
+            self.on_ground = False
+            return
+
+        if theme == "snow":
+            acceleration, friction, max_speed = 0.34, 0.985, 6.5
+        else:
+            acceleration, friction, max_speed = 0.72, 0.82, 5.5
+        if self.blocking:
+            acceleration *= 0.35
+            max_speed *= 0.45
+
+        direction = int(keys[pygame.K_d]) - int(keys[pygame.K_a])
+        if direction:
+            self.facing = direction
+        self.vx += direction * acceleration * frame
+        if direction == 0:
+            self.vx *= friction ** frame
+        self.vx = max(-max_speed, min(max_speed, self.vx))
+        self.rect.x += round(self.vx * frame)
+
+        for platform in platforms:
+            if self.rect.colliderect(platform):
+                if self.vx > 0:
+                    self.rect.right = platform.left
+                elif self.vx < 0:
+                    self.rect.left = platform.right
+                self.vx = 0.0
+
+        if keys[pygame.K_w] and self.on_ground:
+            self.vy = JUMP_SPEED
+            self.on_ground = False
+        if keys[pygame.K_s]:
+            self.vy += 0.35 * frame
+        self.vy = min(self.vy + GRAVITY * frame, MAX_FALL_SPEED)
+        self.rect.y += round(self.vy * frame)
+        self.on_ground = False
+
+        for platform in platforms:
+            if self.rect.colliderect(platform):
+                if self.vy > 0:
+                    self.rect.bottom = platform.top
+                    self.on_ground = True
+                elif self.vy < 0:
+                    self.rect.top = platform.bottom
+                self.vy = 0.0
+
+        if self.rect.left < 0:
+            self.rect.left = 0
+            self.vx = 0.0
+        elif self.rect.right > SCREEN_WIDTH:
+            self.rect.right = SCREEN_WIDTH
+            self.vx = 0.0
+
+
+BIOMES = ("jungle", "snow", "cave", "lava")
+LEVEL_COUNT = 20
+CANDY_ENEMY_NAMES = {
+    "slime": "gumdrop",
+    "snowball": "jellybean",
+    "hopper": "sour_gummy",
+    "mushroom": "cupcake",
+    "cave_shooter": "soda_slinger",
+    "bat": "licorice_twist",
+    "ice_spike": "frost_lollipop",
+    "firebug": "peppermint",
+    "firefly": "fizzy_drop",
+    "boss": "candy_titan",
+    "cave_boss": "candy_warden",
+}
+
+
+def _object(kind, rect):
+    return {"kind": kind, "rect": rect}
+
+
+def _enemy(kind, rect, left, right, speed, amplitude=0, health=1, shoot_cooldown=None):
+    enemy = {
+        "kind": kind, "behavior": kind, "rect": rect, "left": left, "right": right,
+        "speed": speed, "amplitude": amplitude, "health": health,
+    }
+    if shoot_cooldown is not None:
+        enemy["shoot_cooldown"] = shoot_cooldown
+    return enemy
+
+
+def _candy_enemy(enemy):
+    behavior = enemy.get("behavior", enemy["kind"])
+    enemy["behavior"] = behavior
+    enemy["kind"] = CANDY_ENEMY_NAMES.get(behavior, behavior)
+    return enemy
+
+
+def _intersects(rect, other):
+    return rect[0] < other[0] + other[2] and rect[0] + rect[2] > other[0] and rect[1] < other[1] + other[3] and rect[1] + rect[3] > other[1]
+
+
+def _place_clear(rect, blockers, minimum_y=60):
+    x, y, width, height = rect
+    if not any(_intersects(rect, blocker) for blocker in blockers):
+        return rect
+
+    directions = ((-1, 0), (1, 0), (0, -1), (0, 1), (-1, -1), (1, -1), (-1, 1), (1, 1))
+    for distance in range(8, 241, 8):
+        for dx, dy in directions:
+            candidate = (x + dx * distance, y + dy * distance, width, height)
+            if candidate[0] < 0 or candidate[0] + width > 900:
+                continue
+            if candidate[1] < minimum_y or candidate[1] + height > 500:
+                continue
+            if not any(_intersects(candidate, blocker) for blocker in blockers):
+                return candidate
+    return rect
+
+
+def _level(number, name, theme, feature, platforms, objects=(), hazards=(), enemies=(),
+           vines=(), start=(40, 452), weapon_pickup=None, kill_required=False):
+    raised_platforms = tuple(
+        (x, 420 if y >= 460 and width <= 80 and height <= 40 else y, width, height)
+        for x, y, width, height in platforms
+    )
+    platform_blockers = list(raised_platforms)
+    raised_objects = []
+    for item in objects:
+        x, y, width, height = item["rect"]
+        if y + height > 450:
+            y = min(y, 420 - height)
+        rect = _place_clear((x, y, width, height), platform_blockers + [obj["rect"] for obj in raised_objects])
+        raised_objects.append(_object(item["kind"], rect))
+    raised_hazards = []
+    for x, y, width, height in hazards:
+        if y >= 460:
+            y = 420
+        rect = _place_clear((x, y, width, height), platform_blockers + [obj["rect"] for obj in raised_objects] + raised_hazards, minimum_y=100)
+        raised_hazards.append(rect)
+    placed_enemies = []
+    object_blockers = [pygame.Rect(item["rect"]) for item in raised_objects]
+    for spec in enemies:
+        enemy = copy.deepcopy(spec)
+        x, y, width, height = enemy["rect"]
+        if any(pygame.Rect(enemy["rect"]).colliderect(blocker) for blocker in object_blockers):
+            for distance in range(8, 201, 8):
+                candidates = (
+                    (x - distance, y), (x + distance, y),
+                    (x, y - distance), (x, y + distance),
+                )
+                for candidate_x, candidate_y in candidates:
+                    candidate = pygame.Rect(candidate_x, candidate_y, width, height)
+                    if candidate.left < enemy["left"] or candidate.right > enemy["right"]:
+                        continue
+                    if candidate.top < 60 or candidate.bottom > 500:
+                        continue
+                    if not any(candidate.colliderect(blocker) for blocker in object_blockers):
+                        enemy["rect"] = tuple(candidate)
+                        break
+                if tuple(enemy["rect"]) != (x, y, width, height):
+                    break
+        placed_enemies.append(enemy)
+    return {
+        "number": number, "name": name, "theme": theme, "feature": feature,
+        "difficulty": number, "start": start, "goal": (835, 435, 40, 65),
+        "platforms": raised_platforms, "objects": raised_objects,
+        "hazards": raised_hazards, "vines": list(vines),
+        "enemies": placed_enemies, "weapon_pickup": weapon_pickup,
+        "kill_required": kill_required,
+    }
+
+
+def generate_campaign():
+    return [
+        _level(1, "Jungle Canopy", "jungle", "vine and jump practice",
+               ((0, 500, 900, 40), (130, 410, 145, 20), (345, 350, 130, 20), (555, 300, 140, 20), (735, 390, 125, 20), (295, 465, 30, 35)),
+               enemies=(_enemy("slime", (220, 470, 30, 30), 160, 300, 1.0),), vines=((300, 155), (510, 145)), start=(40, 420)),
+        _level(2, "Frozen Ridge", "snow", "snowball patrols",
+               ((0, 500, 900, 40), (120, 420, 160, 20), (330, 350, 145, 20), (535, 285, 155, 20), (740, 390, 120, 20), (290, 465, 35, 35)),
+               enemies=(_enemy("snowball", (170, 470, 30, 30), 120, 280, 1.15), _enemy("hopper", (430, 320, 30, 30), 345, 500, 1.25, 16)), start=(40, 420)),
+        _level(3, "Deep Jungle", "jungle", "three patrolling slimes",
+               ((0, 500, 900, 40), (115, 405, 130, 20), (300, 330, 125, 20), (510, 390, 130, 20), (700, 300, 150, 20), (415, 465, 35, 35)),
+               enemies=(_enemy("slime", (190, 470, 30, 30), 130, 260, 1.3), _enemy("slime", (350, 300, 30, 30), 300, 460, 1.4), _enemy("slime", (640, 270, 30, 30), 565, 740, 1.45)), vines=((265, 150), (475, 145), (670, 155)), start=(40, 420)),
+        _level(4, "Glacier Pass", "snow", "hoppers and ice ledges",
+               ((0, 500, 900, 40), (110, 415, 150, 20), (310, 335, 145, 20), (510, 400, 150, 20), (710, 315, 150, 20), (425, 465, 35, 35)),
+               enemies=(_enemy("snowball", (150, 470, 30, 30), 110, 260, 1.6), _enemy("hopper", (388, 305, 30, 30), 330, 530, 1.65, 20), _enemy("snowball", (685, 285, 30, 30), 710, 820, 1.7)), start=(40, 420)),
+        _level(5, "Fallen Log Run", "jungle", "first thorn pits and slimes",
+               ((0, 500, 270, 40), (355, 500, 220, 40), (675, 500, 225, 40), (135, 430, 130, 18), (285, 385, 135, 18), (445, 430, 135, 18), (625, 385, 130, 18)),
+               objects=(_object("log", (205, 465, 52, 35)), _object("crate", (535, 466, 34, 34))), hazards=((270, 486, 85, 14), (575, 486, 100, 14)), enemies=(_enemy("slime", (390, 470, 30, 30), 365, 530, 1.8),)),
+        _level(6, "Vine Swing Crossing", "jungle", "swing across wide gaps",
+               ((0, 500, 245, 40), (350, 500, 190, 40), (655, 500, 245, 40), (170, 430, 140, 18), (300, 390, 135, 18), (465, 430, 140, 18), (600, 390, 130, 18)),
+               hazards=((245, 486, 105, 14), (540, 486, 115, 14)), enemies=(_enemy("hopper", (400, 395, 30, 30), 365, 500, 1.9, 22),), vines=((300, 220), (590, 215))),
+        _level(7, "Thorn Canopy", "jungle", "hoppers and narrow footholds",
+               ((0, 500, 230, 40), (345, 500, 190, 40), (650, 500, 250, 40), (155, 430, 130, 18), (275, 385, 130, 18), (440, 430, 135, 18), (565, 380, 135, 18), (700, 430, 125, 18)),
+               objects=(_object("tree", (390, 430, 30, 70)),), hazards=((230, 486, 115, 14), (535, 486, 115, 14)), enemies=(_enemy("slime", (370, 470, 30, 30), 350, 505, 1.9), _enemy("hopper", (590, 350, 30, 30), 570, 665, 2.0, 25)), vines=((305, 205),)),
+        _level(8, "Canopy Gauntlet", "jungle", "thorn beds and flying bats",
+               ((0, 500, 205, 40), (330, 500, 175, 40), (610, 500, 290, 40), (120, 430, 130, 18), (240, 380, 130, 18), (390, 425, 130, 18), (510, 375, 130, 18), (680, 425, 125, 18)),
+               hazards=((205, 486, 125, 14), (505, 486, 105, 14)), enemies=(_enemy("slime", (350, 470, 30, 30), 335, 465, 2.0), _enemy("hopper", (535, 345, 30, 30), 515, 600, 2.1, 26), _enemy("bat", (700, 305, 36, 24), 660, 800, 2.1, 30)), vines=((245, 205), (605, 200))),
+        _level(9, "Icefall Bridge", "snow", "slippery ice and snowballs",
+               ((0, 500, 230, 40), (335, 500, 170, 40), (610, 500, 290, 40), (145, 425, 135, 18), (265, 380, 135, 18), (435, 425, 135, 18), (545, 380, 135, 18), (690, 425, 135, 18)),
+               objects=(_object("ice", (380, 462, 35, 38)),), hazards=((230, 486, 105, 14), (505, 486, 105, 14)), enemies=(_enemy("snowball", (355, 470, 30, 30), 340, 475, 2.1), _enemy("hopper", (565, 350, 30, 30), 550, 645, 2.1, 24))),
+        _level(10, "Whiteout Pass", "snow", "flying ice bats",
+               ((0, 500, 205, 40), (325, 500, 180, 40), (625, 500, 275, 40), (120, 430, 130, 18), (245, 380, 130, 18), (410, 425, 130, 18), (525, 375, 130, 18), (690, 425, 130, 18)),
+               objects=(_object("ice", (350, 462, 36, 38)), _object("ice_pillar", (555, 320, 28, 55))), hazards=((205, 486, 120, 14), (505, 486, 120, 14)), enemies=(_enemy("snowball", (350, 470, 30, 30), 335, 465, 2.2), _enemy("hopper", (430, 395, 30, 30), 415, 500, 2.2, 25), _enemy("bat", (560, 315, 36, 24), 535, 690, 2.3, 28))),
+        _level(11, "Glacier Gauntlet", "snow", "three spike pits and ice blocks",
+               ((0, 500, 190, 40), (315, 500, 165, 40), (590, 500, 310, 40), (110, 430, 130, 18), (230, 380, 130, 18), (390, 430, 130, 18), (505, 375, 130, 18), (660, 425, 135, 18)),
+               objects=(_object("ice_pillar", (360, 430, 30, 70)), _object("ice", (690, 462, 36, 38))), hazards=((190, 486, 125, 14), (350, 486, 40, 14), (480, 486, 110, 14)), enemies=(_enemy("snowball", (340, 470, 30, 30), 330, 455, 2.3), _enemy("hopper", (535, 345, 30, 30), 515, 600, 2.4, 27), _enemy("bat", (700, 305, 36, 24), 660, 800, 2.4, 30))),
+        _level(12, "Avalanche Crown", "snow", "armored snowballs and tighter jumps",
+               ((0, 500, 180, 40), (305, 500, 155, 40), (565, 500, 135, 40), (810, 500, 90, 40), (100, 430, 125, 18), (215, 380, 125, 18), (350, 425, 125, 18), (465, 375, 125, 18), (600, 420, 125, 18), (710, 370, 110, 18)),
+               objects=(_object("ice_pillar", (385, 430, 30, 70)),), hazards=((180, 486, 125, 14), (460, 486, 105, 14), (700, 486, 110, 14)), enemies=(_enemy("snowball", (330, 470, 30, 30), 315, 440, 2.5, health=2), _enemy("hopper", (500, 345, 30, 30), 480, 580, 2.5, 28), _enemy("bat", (655, 310, 36, 24), 625, 780, 2.6, 32))),
+        _level(13, "Cave Mouth", "cave", "raised stalactites and cave spitters",
+               ((0, 500, 900, 40), (120, 430, 130, 18), (310, 390, 130, 18), (500, 430, 130, 18), (710, 380, 130, 18)), objects=(_object("cave_block", (270, 350, 42, 70)),), hazards=((280, 365, 46, 16), (605, 385, 54, 16)), enemies=(_enemy("cave_shooter", (570, 340, 36, 36), 550, 690, 1.1, 10, shoot_cooldown=2.3),)),
+        _level(14, "Echo Chamber", "cave", "aimed cave bolts and hanging rock",
+               ((0, 500, 900, 40), (100, 430, 130, 18), (250, 385, 130, 18), (430, 430, 130, 18), (585, 380, 130, 18)), objects=(_object("stalactite", (330, 330, 48, 80)), _object("cave_block", (660, 350, 42, 70))), hazards=((210, 370, 50, 16), (520, 365, 55, 16)), enemies=(_enemy("cave_shooter", (365, 345, 36, 36), 340, 470, 1.3, 14, shoot_cooldown=2.0), _enemy("bat", (640, 320, 36, 24), 610, 770, 2.8, 24))),
+        _level(15, "Crystal Armory", "cave", "weapon: broccoli club", ((0, 500, 900, 40),), objects=(_object("cave_block", (255, 360, 42, 70)), _object("crystal", (640, 380, 30, 40))), hazards=((390, 370, 56, 16), (735, 385, 62, 16)), enemies=(_enemy("mushroom", (505, 470, 34, 30), 475, 600, 2.9, health=2), _enemy("cave_shooter", (760, 340, 36, 36), 740, 840, 1.4, 12, health=2, shoot_cooldown=1.8)), weapon_pickup={"name": "Broccoli Club", "damage": 2, "range": 58, "rect": (390, 448, 28, 40)}),
+        _level(16, "Falling Stalactites", "cave", "ceiling hazards and guarded passages", ((0, 500, 900, 40), (115, 425, 140, 18), (350, 390, 140, 18), (590, 425, 140, 18)), objects=(_object("stalactite", (285, 325, 48, 82)), _object("cave_block", (520, 350, 42, 70))), hazards=((265, 365, 50, 16), (535, 380, 50, 16), (770, 370, 60, 16)), enemies=(_enemy("cave_shooter", (435, 335, 36, 36), 410, 550, 1.5, 16, shoot_cooldown=1.7), _enemy("bat", (700, 345, 36, 24), 675, 810, 3.0, 28))),
+        _level(17, "Deep Hollow", "cave", "crossfire from twin cave sentries", ((0, 500, 900, 40), (100, 430, 130, 18), (295, 385, 130, 18), (500, 430, 130, 18), (700, 385, 135, 18)), objects=(_object("cave_block", (235, 350, 42, 70)), _object("stalactite", (590, 310, 48, 82))), hazards=((260, 370, 50, 16), (650, 360, 55, 16)), enemies=(_enemy("cave_shooter", (380, 340, 36, 36), 350, 470, 1.7, 18, health=2, shoot_cooldown=1.6), _enemy("cave_shooter", (735, 340, 36, 36), 710, 825, 1.8, 16, health=2, shoot_cooldown=1.45), _enemy("bat", (600, 330, 36, 24), 580, 750, 3.1, 32))),
+        _level(18, "Ember Arsenal", "lava", "weapon upgrade: broccoli spear", ((0, 500, 900, 40),), objects=(_object("basalt", (280, 462, 36, 38)), _object("crystal", (650, 390, 30, 40))), hazards=((400, 486, 68, 14), (735, 486, 70, 14)), enemies=(_enemy("firebug", (500, 470, 30, 30), 470, 615, 3.2, health=2), _enemy("firefly", (765, 390, 28, 24), 735, 860, 3.2, 28)), weapon_pickup={"name": "Broccoli Spear", "damage": 4, "range": 82, "rect": (355, 446, 30, 42)}),
+        _level(19, "Siege of the Crater", "lava", "elite guards protect the summit", ((0, 500, 900, 40),), objects=(_object("basalt", (260, 462, 36, 38)), _object("crystal", (500, 390, 30, 40)), _object("basalt", (735, 462, 36, 38))), hazards=((390, 486, 70, 14), (610, 486, 74, 14)), enemies=(_enemy("firebug", (430, 470, 30, 30), 405, 555, 3.3, health=3), _enemy("firefly", (650, 365, 28, 24), 620, 760, 3.4, 32, health=2), _enemy("bat", (815, 340, 36, 24), 780, 865, 3.4, 25, health=2))),
+        _level(20, "Cinder Titan", "lava", "boss: defeat the titan to open the gate", ((0, 500, 900, 40),), objects=(_object("basalt", (310, 462, 36, 38)), _object("crystal", (540, 390, 30, 40))), hazards=((435, 486, 72, 14),), enemies=(_enemy("boss", (700, 408, 88, 92), 620, 805, 1.6, health=16),)),
+    ]
+
+
+def generate_hard_campaign():
+    levels = copy.deepcopy(generate_campaign())
+    kill_gate_levels = {5, 8, 11, 14, 17, 20}
+    for level in levels:
+        number = level["number"]
+        level["name"] = "Hard " + level["name"]
+        level["difficulty"] = number + 10
+        level["kill_required"] = number in kill_gate_levels
+        for enemy in level["enemies"]:
+            enemy["speed"] = (1 if enemy["speed"] >= 0 else -1) * (abs(enemy["speed"]) + 0.35)
+            _candy_enemy(enemy)
+        if level["theme"] == "jungle":
+            bonus = _enemy("slime", (805, 470, 30, 30), 760, 870, 2.0 + number * 0.025, health=2 if number > 10 else 1)
+        elif level["theme"] == "snow":
+            bonus = _enemy("ice_spike", (790, 445, 30, 42), 770, 850, 0, health=2 if number > 10 else 1)
+        elif level["theme"] == "cave":
+            bonus = _enemy("cave_shooter", (790, 340, 36, 36), 760, 845, 1.5, 12, health=2, shoot_cooldown=1.5)
+        else:
+            bonus = _enemy("firebug", (805, 470, 30, 30), 770, 870, 2.2 + number * 0.025, health=2 if number > 10 else 1)
+        level["enemies"].append(_candy_enemy(bonus))
+
+    hard_stages = [
+        _level(21, "Bramble Gauntlet", "jungle", "hard: double patrols and high thorns", ((0, 500, 205, 40), (330, 500, 170, 40), (620, 500, 280, 40), (110, 425, 125, 18), (235, 375, 130, 18), (390, 425, 130, 18), (530, 375, 130, 18), (690, 425, 130, 18)), hazards=((205, 360, 48, 16), (500, 340, 48, 16)), enemies=(_enemy("hopper", (360, 395, 30, 30), 340, 490, 3.2, 35), _enemy("slime", (700, 470, 30, 30), 670, 820, 3.0, health=3)), vines=((270, 205), (590, 190))),
+        _level(22, "Whiteout Crossfire", "snow", "hard: ice spike foes and bats", ((0, 500, 900, 40), (105, 420, 120, 18), (250, 375, 120, 18), (405, 425, 120, 18), (565, 370, 120, 18), (720, 425, 120, 18)), hazards=((200, 345, 46, 16), (480, 325, 50, 16)), enemies=(_enemy("ice_spike", (280, 390, 28, 42), 260, 340, 0, health=3), _enemy("bat", (560, 310, 36, 24), 520, 680, 3.3, 32), _enemy("snowball", (750, 470, 30, 30), 720, 850, 3.2, health=2)), kill_required=True),
+        _level(23, "Crystal Barrage", "cave", "hard: two sentries fire in volleys", ((0, 500, 900, 40), (100, 430, 125, 18), (255, 380, 125, 18), (425, 430, 125, 18), (585, 380, 125, 18), (745, 430, 120, 18)), objects=(_object("cave_block", (345, 345, 42, 70)), _object("stalactite", (650, 310, 48, 80))), hazards=((225, 350, 48, 16), (515, 340, 48, 16)), enemies=(_enemy("cave_shooter", (350, 330, 36, 36), 330, 475, 2.0, 18, health=3, shoot_cooldown=1.1), _enemy("cave_shooter", (700, 330, 36, 36), 675, 820, 2.1, 16, health=3, shoot_cooldown=1.0))),
+        _level(24, "Molten Stairfall", "lava", "hard: timed jumps and firebug pack", ((0, 500, 185, 40), (300, 500, 160, 40), (570, 500, 125, 40), (805, 500, 95, 40), (100, 425, 120, 18), (220, 370, 120, 18), (365, 420, 120, 18), (475, 365, 120, 18), (620, 420, 120, 18), (735, 365, 120, 18)), hazards=((185, 340, 48, 16), (460, 330, 48, 16)), enemies=(_enemy("firebug", (330, 470, 30, 30), 310, 430, 3.4, health=3), _enemy("firefly", (530, 310, 28, 24), 500, 665, 3.5, 30), _enemy("bat", (750, 320, 36, 24), 720, 850, 3.5, 28)), kill_required=True),
+        _level(25, "Frostbite Switchbacks", "snow", "hard: narrow ledges and ice spikes", ((0, 500, 190, 40), (315, 500, 155, 40), (590, 500, 310, 40), (100, 425, 115, 18), (215, 370, 120, 18), (370, 420, 120, 18), (495, 365, 120, 18), (665, 420, 125, 18)), hazards=((235, 330, 48, 16), (520, 325, 50, 16), (755, 350, 48, 16)), enemies=(_enemy("ice_spike", (350, 390, 28, 42), 330, 405, 0, health=3), _enemy("snowball", (620, 470, 30, 30), 600, 760, 3.6, health=3), _enemy("bat", (740, 330, 36, 24), 715, 850, 3.5, 32))),
+        _level(26, "Rootbound Arena", "jungle", "hard: armored hoppers guard the path", ((0, 500, 900, 40),), objects=(_object("tree", (260, 420, 32, 80)), _object("crate", (550, 385, 38, 38)), _object("log", (700, 420, 60, 35))), hazards=((400, 345, 52, 16), (620, 325, 52, 16)), enemies=(_enemy("hopper", (360, 400, 30, 30), 340, 500, 3.5, 34, health=3), _enemy("slime", (680, 470, 30, 30), 650, 810, 3.6, health=3), _enemy("bat", (790, 330, 36, 24), 760, 865, 3.6, 25))),
+        _level(27, "Echo Killhouse", "cave", "hard: clear every sentry to open the exit", ((0, 500, 900, 40), (105, 425, 125, 18), (265, 375, 125, 18), (435, 425, 125, 18), (600, 375, 125, 18)), objects=(_object("cave_block", (245, 345, 42, 70)), _object("stalactite", (545, 300, 48, 82))), hazards=((215, 330, 50, 16), (515, 325, 50, 16)), enemies=(_enemy("cave_shooter", (340, 325, 36, 36), 320, 465, 2.2, 18, health=4, shoot_cooldown=0.9), _enemy("cave_shooter", (680, 325, 36, 36), 650, 820, 2.4, 20, health=4, shoot_cooldown=0.85)), kill_required=True),
+        _level(28, "Cinder Crossfire", "lava", "hard: fireflies shoot from both sides", ((0, 500, 900, 40), (100, 425, 120, 18), (235, 370, 120, 18), (390, 420, 120, 18), (525, 365, 120, 18), (690, 420, 120, 18)), hazards=((205, 335, 48, 16), (490, 325, 48, 16), (740, 345, 48, 16)), enemies=(_enemy("firebug", (320, 470, 30, 30), 300, 450, 3.7, health=4), _enemy("firefly", (510, 305, 28, 24), 480, 650, 3.8, 36), _enemy("bat", (740, 325, 36, 24), 710, 850, 3.8, 32))),
+        _level(29, "The Last Sentries", "cave", "hard: kill the guards before the gate", ((0, 500, 900, 40), (90, 425, 120, 18), (235, 375, 120, 18), (400, 425, 120, 18), (555, 375, 120, 18), (720, 425, 120, 18)), objects=(_object("cave_block", (360, 345, 42, 70)), _object("stalactite", (635, 290, 48, 82))), hazards=((205, 330, 50, 16), (510, 325, 50, 16), (680, 345, 50, 16)), enemies=(_enemy("cave_shooter", (350, 325, 36, 36), 330, 470, 2.6, 22, health=5, shoot_cooldown=0.75), _enemy("cave_shooter", (700, 325, 36, 36), 680, 840, 2.8, 20, health=5, shoot_cooldown=0.7), _enemy("bat", (530, 300, 36, 24), 500, 670, 4.0, 36, health=3)), kill_required=True),
+        _level(30, "Abyssal Warden", "cave", "final boss: block volleys and strike between bursts", ((0, 500, 900, 40), (110, 430, 125, 18), (335, 400, 125, 18), (605, 430, 125, 18)), objects=(_object("cave_block", (270, 350, 42, 70)), _object("stalactite", (550, 275, 48, 82))), hazards=((420, 350, 60, 16), (740, 335, 56, 16)), enemies=(_enemy("cave_boss", (690, 390, 104, 110), 610, 800, 1.8, 14, health=36, shoot_cooldown=0.8),), kill_required=True),
+    ]
+    for level in hard_stages:
+        level["enemies"] = [_candy_enemy(enemy) for enemy in level["enemies"]]
+        if level["theme"] == "cave":
+            level["kill_required"] = level["number"] in (27, 29, 30)
+        if level["number"] == 30:
+            level["boss_volley"] = True
+    return levels + hard_stages
+
+
+LEVELS = generate_campaign()
+
+
+pygame.init()
+
+WIDTH, HEIGHT = 900, 540
+screen = pygame.display.set_mode((WIDTH, HEIGHT))
+pygame.display.set_caption("Broccoli Brigade: Healthy Food Adventure")
+clock = pygame.time.Clock()
+
+font = pygame.font.Font(None, 30)
+big_font = pygame.font.Font(None, 62)
+small_font = pygame.font.Font(None, 23)
+
+WHITE = (255, 255, 255)
+DARK = (30, 35, 45)
+BLUE = (55, 100, 220)
+RED = (210, 60, 60)
+GOLD = (255, 205, 50)
+
+button_rect = pygame.Rect(WIDTH // 2 - 115, HEIGHT // 2 + 50, 230, 54)
+normal_button_rect = pygame.Rect(WIDTH // 2 - 205, HEIGHT // 2 - 5, 180, 62)
+hard_button_rect = pygame.Rect(WIDTH // 2 + 25, HEIGHT // 2 - 5, 180, 62)
+level_menu_button_rect = pygame.Rect(WIDTH - 112, 56, 96, 32)
+ASSET_DIR = Path(__file__).resolve().parent / "assets"
+
+
+def load_keyed_sheet(filename, tolerance=18, key_position=(0, 0)):
+    sheet = pygame.image.load(str(ASSET_DIR / filename)).convert()
+    key = sheet.get_at(key_position)[:3]
+    mapped_key = sheet.map_rgb(key)
+    pixels = pygame.PixelArray(sheet)
+    for y in range(sheet.get_height()):
+        for x in range(sheet.get_width()):
+            color = sheet.unmap_rgb(pixels[x, y])
+            if max(abs(color[index] - key[index]) for index in range(3)) <= tolerance:
+                pixels[x, y] = mapped_key
+    del pixels
+    sheet.set_colorkey(key)
+    return sheet
+
+
+def crop_sprite(sheet, bounds):
+    sprite = sheet.subsurface(pygame.Rect(bounds)).copy()
+    sprite.set_colorkey(sheet.get_colorkey())
+    return sprite
+
+
+_scale_cache = {}
+
+
+def scale_sprite(sprite, size):
+    cache_key = (id(sprite), size)
+    if cache_key not in _scale_cache:
+        scaled = pygame.transform.scale(sprite, size)
+        if sprite.get_colorkey() is not None:
+            scaled.set_colorkey(sprite.get_colorkey())
+        _scale_cache[cache_key] = scaled
+    return _scale_cache[cache_key]
+
+
+lava_sheet = load_keyed_sheet("lava_tiles.jpg")
+snow_sheet = load_keyed_sheet("snow_tiles.jpg")
+jungle_sheet = load_keyed_sheet("unnamed.png", tolerance=0)
+slime_sheet = load_keyed_sheet("unnamed (5).jpg", tolerance=12)
+mushroom_sheet = load_keyed_sheet("unnamed (4).jpg", tolerance=10, key_position=(50, 50))
+cave_props_sheet = load_keyed_sheet("unnamed (6).jpg", tolerance=7)
+CAVE_BACKGROUND = pygame.transform.scale(
+    pygame.image.load(str(ASSET_DIR / "istockphoto-1809486090-170667a.jpg")).convert(),
+    (WIDTH, HEIGHT),
+)
+
+LAVA_PLATFORM_SPRITES = [
+    crop_sprite(lava_sheet, (30, 134, 66, 45)),
+    crop_sprite(lava_sheet, (108, 136, 112, 43)),
+    crop_sprite(lava_sheet, (237, 142, 72, 37)),
+    crop_sprite(lava_sheet, (324, 124, 62, 53)),
+    crop_sprite(lava_sheet, (400, 140, 45, 38)),
+]
+LAVA_ROCK_SPRITES = [
+    crop_sprite(lava_sheet, (25, 188, 108, 73)),
+    crop_sprite(lava_sheet, (144, 206, 70, 55)),
+    crop_sprite(lava_sheet, (218, 215, 78, 48)),
+    crop_sprite(lava_sheet, (301, 194, 71, 67)),
+    crop_sprite(lava_sheet, (370, 203, 89, 58)),
+    crop_sprite(lava_sheet, (474, 216, 64, 46)),
+    crop_sprite(lava_sheet, (548, 222, 39, 38)),
+]
+SNOW_PLATFORM_SPRITES = [
+    crop_sprite(snow_sheet, (91, 271, 82, 36)),
+    crop_sprite(snow_sheet, (96, 320, 79, 34)),
+    crop_sprite(snow_sheet, (185, 320, 75, 30)),
+    crop_sprite(snow_sheet, (263, 319, 77, 34)),
+]
+SNOW_ICE_SPRITES = [
+    crop_sprite(snow_sheet, (92, 271, 81, 36)),
+    crop_sprite(snow_sheet, (96, 320, 79, 34)),
+    crop_sprite(snow_sheet, (185, 320, 75, 30)),
+    crop_sprite(snow_sheet, (263, 319, 77, 34)),
+]
+SNOW_TREE_SPRITES = [
+    crop_sprite(snow_sheet, (151, 22, 119, 235)),
+    crop_sprite(snow_sheet, (277, 22, 123, 235)),
+    crop_sprite(snow_sheet, (407, 23, 95, 145)),
+    crop_sprite(snow_sheet, (516, 49, 96, 113)),
+    crop_sprite(snow_sheet, (406, 173, 88, 157)),
+    crop_sprite(snow_sheet, (512, 171, 94, 159)),
+]
+SNOW_BACKGROUND_TREES = [
+    (scale_sprite(SNOW_TREE_SPRITES[0], (100, 188)), (18, 245)),
+    (scale_sprite(SNOW_TREE_SPRITES[1], (98, 188)), (130, 245)),
+    (scale_sprite(SNOW_TREE_SPRITES[2], (76, 116)), (687, 298)),
+    (scale_sprite(SNOW_TREE_SPRITES[3], (76, 100)), (785, 315)),
+]
+JUNGLE_TERRAIN_SPRITES = [
+    crop_sprite(jungle_sheet, (x, y, 64, 64))
+    for y in (26, 92, 156, 220)
+    for x in (0, 64, 128)
+]
+JUNGLE_TREE_SPRITE = crop_sprite(jungle_sheet, (568, 158, 274, 265))
+JUNGLE_BUSH_SPRITES = [
+    crop_sprite(jungle_sheet, (637, 68, 66, 64)),
+    crop_sprite(jungle_sheet, (717, 68, 64, 64)),
+    crop_sprite(jungle_sheet, (797, 68, 68, 64)),
+    crop_sprite(jungle_sheet, (526, 239, 68, 50)),
+    crop_sprite(jungle_sheet, (540, 318, 64, 55)),
+]
+SLIME_IDLE_FRAMES = [
+    crop_sprite(slime_sheet, (x, 284, 70, 68))
+    for x in (184, 276, 366, 456)
+]
+SLIME_WALK_FRAMES = [
+    crop_sprite(slime_sheet, (x, 375, 70, 68))
+    for x in (184, 276, 366, 456)
+]
+MUSHROOM_IDLE_FRAMES = [
+    crop_sprite(mushroom_sheet, (x, 78, 100, 104))
+    for x in (75, 200, 326, 452)
+]
+MUSHROOM_WALK_FRAMES = [
+    crop_sprite(mushroom_sheet, (x, 207, 100, 105))
+    for x in (75, 198, 321, 445, 568, 693)
+]
+CAVE_STALACTITE_SPRITES = [
+    crop_sprite(cave_props_sheet, (12, 12, 110, 150)),
+    crop_sprite(cave_props_sheet, (210, 12, 150, 145)),
+    crop_sprite(cave_props_sheet, (382, 12, 116, 115)),
+    crop_sprite(cave_props_sheet, (590, 12, 128, 160)),
+]
+CAVE_ROCK_SPRITES = [
+    crop_sprite(cave_props_sheet, (18, 168, 145, 164)),
+    crop_sprite(cave_props_sheet, (215, 168, 135, 164)),
+    crop_sprite(cave_props_sheet, (355, 168, 140, 164)),
+    crop_sprite(cave_props_sheet, (575, 168, 150, 164)),
+]
+
+
+def load_level(index):
+    level = LEVELS[index]
+    player = Player(level["start"])
+
+    enemies = []
+    for spec in level["enemies"]:
+        enemies.append({
+            "kind": spec["kind"],
+            "behavior": spec.get("behavior", spec["kind"]),
+            "rect": pygame.Rect(spec["rect"]),
+            "left": spec["left"],
+            "right": spec["right"],
+            "speed": spec["speed"],
+            "base_y": spec["rect"][1],
+            "amplitude": spec["amplitude"],
+            "phase": 0.0,
+            "health": spec["health"],
+            "max_health": spec["health"],
+            "hit_timer": 0.0,
+            "shoot_cooldown": spec.get("shoot_cooldown", 1.8),
+            "shoot_timer": spec.get("shoot_cooldown", 1.8),
+        })
+
+    objects = [
+        {"kind": item["kind"], "rect": pygame.Rect(item["rect"])}
+        for item in level["objects"]
+    ]
+    hazards = [pygame.Rect(item) for item in level["hazards"]]
+    weapon_pickup = level["weapon_pickup"]
+    if weapon_pickup is not None:
+        weapon_pickup = dict(weapon_pickup)
+        weapon_pickup["rect"] = pygame.Rect(weapon_pickup["rect"])
+
+    return player, enemies, objects, hazards, weapon_pickup, 3, 0.0
+
+
+def update_enemies(enemies, frame, dt):
+    for enemy in enemies:
+        enemy["hit_timer"] = max(0.0, enemy["hit_timer"] - dt)
+        behavior = enemy.get("behavior", enemy["kind"])
+        rect = enemy["rect"]
+        rect.x += round(enemy["speed"] * frame)
+
+        if rect.left <= enemy["left"]:
+            rect.left = enemy["left"]
+            enemy["speed"] = abs(enemy["speed"])
+        elif rect.right >= enemy["right"]:
+            rect.right = enemy["right"]
+            enemy["speed"] = -abs(enemy["speed"])
+
+        if enemy["amplitude"]:
+            enemy["phase"] += dt * (6.0 if behavior == "hopper" else 3.2)
+            if behavior == "hopper":
+                rect.y = enemy["base_y"] - round(abs(math.sin(enemy["phase"])) * enemy["amplitude"])
+            else:
+                rect.y = enemy["base_y"] + round(math.sin(enemy["phase"]) * enemy["amplitude"])
+
+
+def update_projectiles(enemies, projectiles, player, dt, solids, food_drops):
+    for enemy in enemies:
+        behavior = enemy.get("behavior", enemy["kind"])
+        if behavior not in ("cave_shooter", "cave_boss"):
+            continue
+
+        enemy["shoot_timer"] -= dt
+        if enemy["shoot_timer"] <= 0:
+            dx = player.rect.centerx - enemy["rect"].centerx
+            dy = player.rect.centery - enemy["rect"].centery
+            distance = max(1.0, math.hypot(dx, dy))
+            speed = 220.0 if behavior == "cave_boss" else 190.0
+            spread = (-0.22, 0.0, 0.22) if behavior == "cave_boss" else (0.0,)
+            aim_angle = math.atan2(dy, dx)
+            for offset in spread:
+                angle = aim_angle + offset
+                projectiles.append({
+                    "team": "enemy",
+                    "rect": pygame.Rect(enemy["rect"].centerx - 7, enemy["rect"].centery - 7, 14, 14),
+                    "vx": math.cos(angle) * speed,
+                    "vy": math.sin(angle) * speed,
+                    "source_x": enemy["rect"].centerx,
+                    "damage": 1,
+                    "life": 4.5,
+                })
+            enemy["shoot_timer"] = enemy["shoot_cooldown"]
+
+    for projectile in projectiles[:]:
+        rect = projectile["rect"]
+        rect.x += round(projectile["vx"] * dt)
+        rect.y += round(projectile["vy"] * dt)
+        projectile["life"] -= dt
+        if projectile["team"] == "player":
+            hit_enemy = next((enemy for enemy in enemies if rect.colliderect(enemy["rect"])), None)
+            if hit_enemy:
+                hit_enemy["health"] -= projectile["damage"]
+                hit_enemy["hit_timer"] = 0.16
+                if hit_enemy["health"] <= 0:
+                    spawn_food_drop(hit_enemy, food_drops)
+                    enemies.remove(hit_enemy)
+                projectiles.remove(projectile)
+                continue
+        blocked_by_terrain = any(rect.colliderect(solid) for solid in solids)
+        if projectile["life"] <= 0 or not pygame.Rect(0, 0, WIDTH, HEIGHT).colliderect(rect) or blocked_by_terrain:
+            projectiles.remove(projectile)
+
+
+def draw_projectiles(projectiles):
+    for projectile in projectiles:
+        rect = projectile["rect"]
+        if projectile["team"] == "player":
+            direction = 1 if projectile["vx"] > 0 else -1
+            tail_x = rect.right if direction < 0 else rect.left
+            tip_x = rect.left if direction < 0 else rect.right
+            pygame.draw.line(screen, (107, 151, 63), (tail_x, rect.centery), (tip_x, rect.centery), 4)
+            for dx, dy, radius in ((0, -4, 5), (direction * 3, 0, 5), (0, 4, 4)):
+                pygame.draw.circle(screen, (75, 171, 83), (tip_x + direction * dx, rect.centery + dy), radius)
+            continue
+        pygame.draw.circle(screen, (75, 58, 117), rect.center, 10)
+        pygame.draw.circle(screen, (203, 160, 255), rect.center, 6)
+        pygame.draw.circle(screen, (246, 230, 255), (rect.centerx - 2, rect.centery - 2), 2)
+
+
+def shoot_arrow(player, projectiles):
+    direction = player.facing
+    x = player.rect.right if direction > 0 else player.rect.left - 24
+    projectiles.append({
+        "team": "player",
+        "rect": pygame.Rect(x, player.rect.centery - 3, 24, 6),
+        "vx": direction * 420.0,
+        "vy": 0.0,
+        "source_x": player.rect.centerx,
+        "damage": 2,
+        "life": 2.2,
+    })
+
+
+FOOD_FACTS = {
+    "apple": "Apples contain fiber, which helps digestion.",
+    "carrot": "Carrots contain beta-carotene, which your body uses to make vitamin A.",
+    "orange": "Oranges are a source of vitamin C.",
+    "banana": "Bananas provide potassium, which helps muscles work.",
+    "broccoli": "Broccoli provides fiber and vitamin C.",
+    "strawberry": "Strawberries contain vitamin C and fiber.",
+}
+
+
+FOOD_REWARDS = {
+    "slime": "apple", "snowball": "orange", "hopper": "carrot",
+    "mushroom": "strawberry", "cave_shooter": "banana", "bat": "orange",
+    "ice_spike": "apple", "firebug": "carrot", "firefly": "strawberry",
+    "boss": "broccoli", "cave_boss": "broccoli",
+}
+
+
+def spawn_food_drop(enemy, food_drops):
+    behavior = enemy.get("behavior", enemy["kind"])
+    kind = FOOD_REWARDS.get(behavior, "apple")
+    rect = enemy["rect"]
+    food_drops.append({
+        "kind": kind,
+        "rect": pygame.Rect(rect.centerx - 11, rect.top - 22, 22, 22),
+        "bob": 0.0,
+    })
+
+
+def collect_food_drop(player, food_drops):
+    for drop in food_drops:
+        if player.rect.colliderect(drop["rect"]):
+            food_drops.remove(drop)
+            return drop["kind"]
+    return None
+
+
+def perform_attack(player, enemies, weapon, food_drops):
+    damage = weapon["damage"] if weapon else 1
+    reach = weapon["range"] if weapon else 44
+    attack_y = player.rect.y + 12
+    attack_x = player.rect.right - 4 if player.facing > 0 else player.rect.left - reach + 4
+    attack_rect = pygame.Rect(attack_x, attack_y, reach, 28)
+
+    for enemy in enemies[:]:
+        if attack_rect.colliderect(enemy["rect"]):
+            enemy["health"] -= damage
+            enemy["hit_timer"] = 0.16
+            if enemy["health"] <= 0:
+                spawn_food_drop(enemy, food_drops)
+                enemies.remove(enemy)
+
+    return attack_rect
+
+
+def draw_weapon_pickup(pickup):
+    rect = pickup["rect"]
+    pygame.draw.line(screen, (73, 133, 59), rect.midbottom, rect.midtop, 6)
+    pygame.draw.line(screen, (137, 193, 91), (rect.centerx - 2, rect.centery), (rect.centerx - 2, rect.bottom - 3), 2)
+    for dx, dy, radius in ((-6, -2, 7), (0, -8, 8), (6, -2, 7), (0, 0, 6)):
+        pygame.draw.circle(screen, (54, 145, 71), (rect.centerx + dx, rect.top + 11 + dy), radius)
+        pygame.draw.circle(screen, (125, 202, 102), (rect.centerx + dx - 2, rect.top + 9 + dy), 2)
+
+
+def draw_food_drops(food_drops):
+    for drop in food_drops:
+        rect = drop["rect"].move(0, round(math.sin(drop["bob"]) * 3))
+        center = rect.center
+        kind = drop["kind"]
+        if kind == "apple":
+            pygame.draw.circle(screen, (203, 61, 69), center, 10)
+            pygame.draw.line(screen, (100, 66, 42), (center[0], rect.top + 2), (center[0] + 1, rect.top - 3), 2)
+            pygame.draw.ellipse(screen, (86, 169, 82), (center[0] + 1, rect.top - 4, 8, 5))
+            pygame.draw.circle(screen, (255, 180, 153), (center[0] - 3, center[1] - 3), 2)
+        elif kind == "carrot":
+            pygame.draw.polygon(screen, (238, 135, 47), [(rect.left + 3, rect.top + 3), (rect.right - 2, rect.top + 5), (center[0], rect.bottom)])
+            pygame.draw.line(screen, (119, 190, 87), (center[0], rect.top + 4), (center[0] - 5, rect.top - 3), 3)
+            pygame.draw.line(screen, (119, 190, 87), (center[0] + 1, rect.top + 4), (center[0] + 5, rect.top - 4), 3)
+            pygame.draw.line(screen, (255, 196, 105), (center[0] - 2, center[1]), (center[0] - 1, center[1] + 3), 1)
+        elif kind == "orange":
+            pygame.draw.circle(screen, (242, 151, 53), center, 10)
+            pygame.draw.ellipse(screen, (89, 169, 84), (center[0] - 1, rect.top - 2, 8, 5))
+            pygame.draw.circle(screen, (255, 202, 109), (center[0] - 3, center[1] - 3), 2)
+        elif kind == "banana":
+            pygame.draw.arc(screen, (255, 220, 91), rect.inflate(4, 4), 0.1, 2.8, 7)
+            pygame.draw.arc(screen, (255, 243, 163), rect.inflate(-5, -5), 0.1, 2.8, 2)
+        elif kind == "broccoli":
+            pygame.draw.rect(screen, (97, 158, 69), (center[0] - 3, center[1], 6, 9))
+            for dx, dy, radius in ((-5, -2, 6), (0, -6, 7), (5, -1, 6)):
+                pygame.draw.circle(screen, (72, 157, 83), (center[0] + dx, center[1] + dy), radius)
+                pygame.draw.circle(screen, (136, 202, 109), (center[0] + dx - 2, center[1] + dy - 2), 2)
+        else:
+            pygame.draw.polygon(screen, (220, 61, 100), [(center[0], rect.top), (rect.right, center[1] - 1), (center[0], rect.bottom), (rect.left, center[1] - 1)])
+            for dx, dy in ((-4, -3), (3, 0), (0, 5), (4, -5)):
+                pygame.draw.circle(screen, (255, 231, 173), (center[0] + dx, center[1] + dy), 1)
+
+
+def draw_attack_effect(attack_rect, theme):
+    color = {
+        "jungle": (202, 244, 154), "snow": (188, 240, 255),
+        "lava": (255, 220, 127), "cave": (211, 188, 255),
+    }[theme]
+    pygame.draw.arc(screen, color, attack_rect, math.pi * 0.1, math.pi * 1.15, 3)
+
+
+def draw_background(theme, level=None):
+    if theme == "jungle":
+        screen.fill((105, 195, 220))
+
+        pygame.draw.ellipse(screen, (90, 170, 110), (-110, 300, 500, 300))
+        pygame.draw.ellipse(screen, (60, 150, 90), (250, 330, 520, 280))
+        pygame.draw.ellipse(screen, (45, 125, 80), (610, 300, 400, 300))
+
+        tree = scale_sprite(JUNGLE_TREE_SPRITE, (250, 242))
+        screen.blit(tree, (-112, 274))
+        screen.blit(tree, (618, 255))
+        bush_positions = [(92, 397), (470, 423), (842, 397)]
+        for index, position in enumerate(bush_positions):
+            bush = scale_sprite(JUNGLE_BUSH_SPRITES[(index + (level["number"] if level else 0)) % len(JUNGLE_BUSH_SPRITES)], (48, 38))
+            screen.blit(bush, position)
+
+        pygame.draw.circle(screen, (255, 225, 110), (770, 90), 38)
+
+    elif theme == "snow":
+        screen.fill((150, 205, 235))
+
+        pygame.draw.polygon(
+            screen, (210, 230, 240),
+            [(0, 410), (170, 150), (355, 410)],
+        )
+        pygame.draw.polygon(
+            screen, (240, 248, 255),
+            [(95, 265), (170, 150), (245, 265), (200, 245), (170, 270), (140, 245)],
+        )
+        pygame.draw.polygon(
+            screen, (185, 215, 235),
+            [(250, 420), (500, 125), (735, 420)],
+        )
+        pygame.draw.polygon(
+            screen, (245, 250, 255),
+            [(405, 240), (500, 125), (590, 240), (535, 220), (500, 245), (465, 220)],
+        )
+        pygame.draw.polygon(
+            screen, (205, 228, 242),
+            [(610, 420), (800, 205), (990, 420)],
+        )
+        for sprite, position in SNOW_BACKGROUND_TREES:
+            screen.blit(sprite, position)
+        pygame.draw.rect(screen, (235, 246, 252), (0, 440, WIDTH, 100))
+
+        for x, y in [(80, 90), (225, 180), (390, 75), (620, 150), (810, 105), (700, 225)]:
+            pygame.draw.circle(screen, WHITE, (x, y), 3)
+
+    elif theme == "cave":
+        screen.blit(CAVE_BACKGROUND, (0, 0))
+        if level and level["number"] % 2 == 0:
+            for index, x in enumerate((75, 365, 705)):
+                sprite = scale_sprite(CAVE_STALACTITE_SPRITES[(index + level["number"]) % len(CAVE_STALACTITE_SPRITES)], (75, 105))
+                screen.blit(sprite, (x, 22))
+            for index, x in enumerate((150, 455, 790)):
+                sprite = scale_sprite(CAVE_ROCK_SPRITES[(index + level["number"]) % len(CAVE_ROCK_SPRITES)], (94, 88))
+                screen.blit(sprite, (x, 415))
+
+    else:
+        screen.fill((51, 35, 48))
+        pygame.draw.circle(screen, (255, 116, 48), (770, 98), 42)
+        pygame.draw.polygon(
+            screen, (91, 56, 61),
+            [(0, 360), (135, 225), (270, 355), (440, 190), (655, 365), (810, 220), (900, 315), (900, 500), (0, 500)],
+        )
+        pygame.draw.polygon(
+            screen, (67, 45, 54),
+            [(0, 420), (210, 305), (390, 420), (570, 275), (785, 425), (900, 345), (900, 500), (0, 500)],
+        )
+        for index in range(22):
+            x = (index * 83 + 31) % WIDTH
+            y = (index * 47 + 65) % 330
+            pygame.draw.circle(screen, (226, 107, 62), (x, y), 2)
+
+
+def draw_platforms(platforms, theme):
+    for index, platform in enumerate(platforms):
+        if theme == "jungle":
+            for tile_x in range(platform.left, platform.right, 64):
+                tile_index = (index * 3 + (tile_x - platform.left) // 64) % len(JUNGLE_TERRAIN_SPRITES)
+                visible_width = min(64, platform.right - tile_x)
+                screen.blit(
+                    JUNGLE_TERRAIN_SPRITES[tile_index],
+                    (tile_x, platform.y),
+                    pygame.Rect(0, 0, visible_width, 64),
+                )
+        elif theme == "snow":
+            pygame.draw.rect(screen, (115, 145, 165), platform)
+            pygame.draw.rect(
+                screen, (245, 250, 255),
+                (platform.x, platform.y, platform.width, 8),
+            )
+            sprite = SNOW_PLATFORM_SPRITES[index % len(SNOW_PLATFORM_SPRITES)]
+            tile_width = 120 if platform.width > 240 else platform.width
+            tile_height = platform.height + 12
+            scaled = scale_sprite(sprite, (tile_width, tile_height))
+            for tile_x in range(platform.left, platform.right, tile_width):
+                visible_width = min(tile_width, platform.right - tile_x)
+                screen.blit(
+                    scaled,
+                    (tile_x, platform.y - 6),
+                    pygame.Rect(0, 0, visible_width, tile_height),
+                )
+            pygame.draw.line(
+                screen, (200, 225, 240),
+                (platform.x + 8, platform.y + 13),
+                (platform.right - 8, platform.y + 13),
+                2,
+            )
+        elif theme == "cave":
+            pygame.draw.polygon(
+                screen, (59, 52, 77),
+                [(platform.left, platform.top + 8), (platform.left + 12, platform.top + 2),
+                 (platform.right - 10, platform.top), (platform.right, platform.top + 7),
+                 platform.bottomright, platform.bottomleft],
+            )
+            pygame.draw.line(
+                screen, (153, 135, 174),
+                (platform.left + 5, platform.top + 4), (platform.right - 8, platform.top + 3), 3,
+            )
+            for crack_x in range(platform.left + 20, platform.right - 12, 54):
+                pygame.draw.line(
+                    screen, (91, 80, 111),
+                    (crack_x, platform.top + 12), (crack_x + 7, platform.bottom - 3), 2,
+                )
+        else:
+            pygame.draw.rect(screen, (74, 49, 53), platform)
+            sprite = LAVA_PLATFORM_SPRITES[index % len(LAVA_PLATFORM_SPRITES)]
+            tile_width = 135 if platform.width > 240 else platform.width
+            tile_height = platform.height + 14
+            scaled = scale_sprite(sprite, (tile_width, tile_height))
+            for tile_x in range(platform.left, platform.right, tile_width):
+                visible_width = min(tile_width, platform.right - tile_x)
+                screen.blit(
+                    scaled,
+                    (tile_x, platform.y - 7),
+                    pygame.Rect(0, 0, visible_width, tile_height),
+                )
+
+
+def draw_objects(objects):
+    for index, item in enumerate(objects):
+        rect = item["rect"]
+        if item["kind"] == "tree":
+            tree = scale_sprite(JUNGLE_TREE_SPRITE, (92, 100))
+            screen.blit(tree, (rect.centerx - 46, rect.bottom - 100))
+        elif item["kind"] == "log":
+            pygame.draw.polygon(
+                screen, (104, 67, 43),
+                [(rect.left + 3, rect.top + 6), (rect.left + 10, rect.top),
+                 (rect.right - 6, rect.top + 2), (rect.right, rect.top + 9),
+                 (rect.right - 2, rect.bottom - 4), (rect.left + 2, rect.bottom)],
+            )
+            pygame.draw.ellipse(screen, (184, 130, 77), (rect.left + 2, rect.top + 5, 12, rect.height - 10), 2)
+            pygame.draw.line(screen, (72, 48, 34), rect.midleft, rect.midright, 2)
+        elif item["kind"] == "crate":
+            pygame.draw.polygon(
+                screen, (151, 91, 49),
+                [(rect.left + 3, rect.top), (rect.right - 5, rect.top),
+                 (rect.right, rect.top + 5), (rect.right - 3, rect.bottom),
+                 (rect.left, rect.bottom - 3)],
+            )
+            pygame.draw.line(screen, (231, 173, 96), rect.topleft, rect.bottomright, 3)
+            pygame.draw.line(screen, (231, 173, 96), rect.topright, rect.bottomleft, 3)
+            pygame.draw.polygon(
+                screen, (69, 50, 42),
+                [(rect.left, rect.top), (rect.right, rect.top),
+                 (rect.right, rect.bottom), (rect.left, rect.bottom)],
+                2,
+            )
+        elif item["kind"] == "ice":
+            sprite = SNOW_ICE_SPRITES[index % len(SNOW_ICE_SPRITES)]
+            screen.blit(scale_sprite(sprite, rect.size), rect.topleft)
+        elif item["kind"] == "ice_pillar":
+            pygame.draw.polygon(
+                screen, (111, 190, 218),
+                [(rect.centerx, rect.top), (rect.right, rect.bottom - 5),
+                 (rect.centerx + 4, rect.bottom), (rect.left, rect.bottom - 5)],
+            )
+            pygame.draw.polygon(
+                screen, (219, 246, 255),
+                [(rect.centerx, rect.top + 5), (rect.centerx + 4, rect.bottom - 7),
+                 (rect.centerx - 3, rect.bottom - 4)],
+            )
+        elif item["kind"] == "crystal":
+            pygame.draw.polygon(
+                screen, (219, 93, 48),
+                [(rect.left, rect.bottom), (rect.left + 4, rect.top + 10),
+                 (rect.centerx - 4, rect.top), (rect.centerx + 5, rect.top + 8),
+                 (rect.right, rect.bottom)],
+            )
+            pygame.draw.line(screen, (255, 190, 77), (rect.centerx - 3, rect.top + 9), (rect.centerx - 1, rect.bottom - 4), 2)
+        elif item["kind"] in ("stalactite", "cave_block"):
+            sprites = CAVE_STALACTITE_SPRITES if item["kind"] == "stalactite" else CAVE_ROCK_SPRITES
+            sprite = sprites[index % len(sprites)]
+            screen.blit(scale_sprite(sprite, rect.size), rect.topleft)
+        else:
+            sprite = LAVA_ROCK_SPRITES[(rect.x // 40 + index) % len(LAVA_ROCK_SPRITES)]
+            screen.blit(scale_sprite(sprite, rect.size), rect.topleft)
+
+
+def draw_hazards(hazards, theme):
+    for hazard in hazards:
+        if theme == "jungle":
+            pygame.draw.polygon(
+                screen, (78, 105, 54),
+                [(hazard.left, hazard.bottom), (hazard.left + 8, hazard.top + 6),
+                 (hazard.centerx, hazard.top), (hazard.right - 7, hazard.top + 5),
+                 (hazard.right, hazard.bottom)],
+            )
+            color = (42, 116, 52)
+        elif theme == "snow":
+            sprite = SNOW_ICE_SPRITES[(hazard.x // 48) % len(SNOW_ICE_SPRITES)]
+            scaled = scale_sprite(sprite, (hazard.width, hazard.height + 12))
+            screen.blit(scaled, (hazard.x, hazard.y - 10))
+            continue
+        elif theme == "cave":
+            sprite = CAVE_STALACTITE_SPRITES[(hazard.x // 48) % len(CAVE_STALACTITE_SPRITES)]
+            scaled = scale_sprite(sprite, (hazard.width + 16, hazard.height + 38))
+            screen.blit(scaled, (hazard.x - 8, hazard.y - 36))
+            continue
+        else:
+            pygame.draw.polygon(
+                screen, (75, 38, 42),
+                [(hazard.left, hazard.bottom), (hazard.left + 5, hazard.top + 5),
+                 (hazard.centerx, hazard.top + 2), (hazard.right - 6, hazard.top + 6),
+                 (hazard.right, hazard.bottom)],
+            )
+            pygame.draw.polygon(
+                screen, (242, 101, 42),
+                [(hazard.left + 3, hazard.bottom), (hazard.left + 11, hazard.top + 8),
+                 (hazard.centerx + 2, hazard.top + 5), (hazard.right - 4, hazard.bottom)],
+            )
+            color = (255, 172, 65)
+
+        if theme != "lava":
+            for x in range(hazard.x, hazard.right, 12):
+                pygame.draw.polygon(
+                    screen, color,
+                    [(x, hazard.bottom), (x + 6, hazard.y), (x + 12, hazard.bottom)],
+                )
+
+
+def draw_vines(vines, attached, swing_anchor, swing_angle):
+    for anchor in vines:
+        if attached and anchor == swing_anchor:
+            end_x = anchor[0] + math.sin(swing_angle) * 135
+            end_y = anchor[1] + math.cos(swing_angle) * 135
+        else:
+            end_x = anchor[0] + 8
+            end_y = anchor[1] + 100
+
+        pygame.draw.line(
+            screen, (45, 105, 45),
+            anchor, (round(end_x), round(end_y)), 5,
+        )
+        pygame.draw.circle(screen, (35, 125, 55), anchor, 8)
+
+
+def _draw_original_enemy_art(enemies):
+    for enemy in enemies:
+        rect = enemy["rect"]
+        center_x = rect.centerx
+        center_y = rect.centery
+        kind = enemy["kind"]
+
+        if kind == "slime":
+            frames = SLIME_WALK_FRAMES if abs(enemy["speed"]) > 0.1 else SLIME_IDLE_FRAMES
+            sprite = frames[(pygame.time.get_ticks() // 150) % len(frames)]
+            sprite = scale_sprite(sprite, (42, 42))
+            if enemy["speed"] < 0:
+                sprite = pygame.transform.flip(sprite, True, False)
+            screen.blit(sprite, (center_x - 21, rect.bottom - 40))
+            if enemy["max_health"] > 1:
+                pygame.draw.rect(screen, DARK, (rect.x, rect.y - 7, rect.width, 5))
+                pygame.draw.rect(screen, (91, 214, 128), (rect.x, rect.y - 7, rect.width * enemy["health"] // enemy["max_health"], 5))
+            if enemy["hit_timer"] > 0:
+                pygame.draw.rect(screen, WHITE, rect, 2)
+            continue
+
+        if kind == "mushroom":
+            frames = MUSHROOM_WALK_FRAMES if abs(enemy["speed"]) > 0.1 else MUSHROOM_IDLE_FRAMES
+            sprite = frames[(pygame.time.get_ticks() // 175) % len(frames)]
+            sprite = scale_sprite(sprite, (46, 48))
+            if enemy["speed"] < 0:
+                sprite = pygame.transform.flip(sprite, True, False)
+            screen.blit(sprite, (center_x - 23, rect.bottom - 45))
+            if enemy["max_health"] > 1:
+                pygame.draw.rect(screen, DARK, (rect.x, rect.y - 7, rect.width, 5))
+                pygame.draw.rect(screen, (207, 97, 165), (rect.x, rect.y - 7, rect.width * enemy["health"] // enemy["max_health"], 5))
+            if enemy["hit_timer"] > 0:
+                pygame.draw.rect(screen, WHITE, rect, 2)
+            continue
+
+        if kind == "cave_shooter":
+            body = (92, 82, 122)
+            pygame.draw.polygon(
+                screen, (48, 42, 66),
+                [(rect.left + 3, rect.top + 10), (rect.left + 11, rect.top + 3),
+                 (rect.right - 8, rect.top + 8), (rect.right - 2, rect.bottom - 7),
+                 (rect.centerx, rect.bottom), (rect.left + 2, rect.bottom - 8)],
+            )
+            pygame.draw.ellipse(screen, body, (rect.x + 5, rect.y + 7, rect.width - 10, rect.height - 11))
+            pygame.draw.circle(screen, (207, 174, 255), (center_x + (5 if enemy["speed"] >= 0 else -5), center_y - 3), 5)
+            pygame.draw.circle(screen, (43, 35, 57), (center_x + (6 if enemy["speed"] >= 0 else -4), center_y - 3), 2)
+            pygame.draw.polygon(
+                screen, (151, 132, 183),
+                [(rect.left + 7, rect.top + 8), (rect.left + 13, rect.top - 5), (rect.left + 17, rect.top + 10)],
+            )
+            pygame.draw.polygon(
+                screen, (151, 132, 183),
+                [(rect.right - 7, rect.top + 8), (rect.right - 13, rect.top - 5), (rect.right - 17, rect.top + 10)],
+            )
+            continue
+
+        if kind in ("boss", "cave_boss"):
+            pygame.draw.polygon(
+                screen, (64, 43, 48),
+                [(rect.left + 5, rect.bottom - 5), (rect.left + 8, rect.top + 28),
+                 (rect.left + 22, rect.top + 12), (rect.centerx, rect.top + 22),
+                 (rect.right - 18, rect.top + 8), (rect.right - 5, rect.top + 34),
+                 (rect.right - 2, rect.bottom - 5)],
+            )
+            pygame.draw.polygon(
+                screen, (164, 67, 45),
+                [(rect.left + 12, rect.bottom - 8), (rect.left + 18, rect.top + 35),
+                 (rect.centerx, rect.top + 24), (rect.right - 14, rect.top + 37),
+                 (rect.right - 8, rect.bottom - 8)],
+            )
+            pygame.draw.polygon(
+                screen, (255, 180, 77),
+                [(rect.left + 16, rect.top + 27), (rect.left + 4, rect.top - 2),
+                 (rect.left + 30, rect.top + 19)],
+            )
+            pygame.draw.polygon(
+                screen, (255, 180, 77),
+                [(rect.right - 16, rect.top + 27), (rect.right - 4, rect.top - 2),
+                 (rect.right - 30, rect.top + 19)],
+            )
+            pygame.draw.circle(screen, (255, 226, 105), (center_x - 17, center_y - 4), 5)
+            pygame.draw.circle(screen, (255, 226, 105), (center_x + 17, center_y - 4), 5)
+            pygame.draw.circle(screen, DARK, (center_x - 17, center_y - 4), 2)
+            pygame.draw.circle(screen, DARK, (center_x + 17, center_y - 4), 2)
+            pygame.draw.rect(screen, DARK, (rect.x + 8, rect.y - 13, rect.width - 16, 8))
+            pygame.draw.rect(screen, (226, 72, 53), (rect.x + 10, rect.y - 11, (rect.width - 20) * enemy["health"] // enemy["max_health"], 4))
+            continue
+
+        if kind in ("slime", "hopper"):
+            body_color = (81, 170, 74) if kind == "slime" else (198, 180, 90)
+            pygame.draw.ellipse(screen, (43, 62, 49), (rect.x + 2, rect.bottom - 7, rect.width - 4, 7))
+            pygame.draw.ellipse(screen, body_color, (rect.x + 2, rect.y + 5, rect.width - 4, rect.height - 6))
+            pygame.draw.ellipse(screen, (148, 212, 101), (rect.x + 7, rect.y + 8, rect.width // 2, 7))
+            pygame.draw.circle(screen, WHITE, (center_x - 5, center_y - 1), 4)
+            pygame.draw.circle(screen, WHITE, (center_x + 6, center_y - 1), 4)
+            pygame.draw.circle(screen, DARK, (center_x - 4, center_y), 2)
+            pygame.draw.circle(screen, DARK, (center_x + 7, center_y), 2)
+        elif kind == "snowball":
+            pygame.draw.circle(screen, (145, 203, 222), (center_x, rect.bottom - 2), rect.width // 2)
+            pygame.draw.circle(screen, (224, 245, 249), (center_x, center_y - 1), rect.width // 2 - 1)
+            pygame.draw.arc(screen, (107, 171, 197), (rect.x + 5, rect.y + 12, rect.width - 10, 14), 3.3, 6.1, 2)
+            pygame.draw.circle(screen, DARK, (center_x - 5, center_y - 2), 2)
+            pygame.draw.circle(screen, DARK, (center_x + 5, center_y - 2), 2)
+        elif kind == "ice_spike":
+            points = [
+                (center_x, rect.top), (rect.left + 5, rect.bottom - 3),
+                (center_x - 5, rect.bottom), (rect.left + 12, rect.bottom - 5),
+                (center_x + 4, rect.bottom - 1), (rect.right - 3, rect.bottom - 5),
+            ]
+            pygame.draw.polygon(screen, (91, 157, 190), points)
+            pygame.draw.polygon(screen, (218, 243, 255), [(center_x, rect.top + 4), (center_x - 3, rect.bottom - 8), (center_x + 3, rect.bottom - 8)])
+            pygame.draw.circle(screen, (45, 70, 93), (center_x - 4, rect.y + 22), 2)
+            pygame.draw.circle(screen, (45, 70, 93), (center_x + 4, rect.y + 22), 2)
+        elif kind == "bat":
+            pygame.draw.polygon(
+                screen, (67, 66, 94),
+                [(center_x, center_y), (rect.left, rect.top + 2), (rect.left + 5, rect.bottom - 2),
+                 (center_x - 2, center_y + 3), (rect.right - 5, rect.bottom - 2), (rect.right, rect.top + 2)],
+            )
+            pygame.draw.ellipse(screen, (109, 91, 130), (center_x - 7, center_y - 7, 14, 17))
+            pygame.draw.circle(screen, (255, 106, 92), (center_x - 3, center_y - 2), 2)
+            pygame.draw.circle(screen, (255, 106, 92), (center_x + 3, center_y - 2), 2)
+        elif kind == "firefly":
+            pygame.draw.circle(screen, (231, 112, 49), (center_x, center_y), 14)
+            pygame.draw.ellipse(screen, (255, 205, 87), (center_x - 5, center_y - 8, 10, 16))
+            pygame.draw.ellipse(screen, (255, 220, 156), (rect.x + 1, rect.y + 2, 10, 8))
+            pygame.draw.ellipse(screen, (255, 220, 156), (rect.right - 11, rect.y + 2, 10, 8))
+            pygame.draw.circle(screen, DARK, (center_x - 2, center_y - 2), 1)
+            pygame.draw.circle(screen, DARK, (center_x + 3, center_y - 2), 1)
+        else:
+            pygame.draw.ellipse(screen, (171, 65, 50), (rect.x + 2, rect.y + 7, rect.width - 4, rect.height - 8))
+            pygame.draw.ellipse(screen, (237, 130, 55), (rect.x + 5, rect.y + 3, rect.width - 10, 14))
+            for leg_x in (rect.x + 6, rect.centerx, rect.right - 8):
+                pygame.draw.line(screen, (77, 45, 43), (leg_x, rect.bottom - 4), (leg_x - 3, rect.bottom), 2)
+            pygame.draw.circle(screen, (255, 227, 120), (center_x + 5, center_y - 1), 2)
+
+        if enemy["hit_timer"] > 0:
+            pygame.draw.rect(screen, WHITE, rect, 2)
+
+
+def draw_enemies(enemies):
+    flavors = {
+        "slime": (72, 179, 132), "snowball": (106, 192, 230),
+        "hopper": (220, 91, 131), "mushroom": (225, 119, 157),
+        "cave_shooter": (130, 101, 193), "bat": (103, 87, 152),
+        "ice_spike": (113, 190, 224), "firebug": (239, 117, 56),
+        "firefly": (246, 191, 66), "boss": (198, 71, 94),
+        "cave_boss": (154, 63, 117),
+    }
+    for enemy in enemies:
+        rect = enemy["rect"]
+        behavior = enemy.get("behavior", enemy["kind"])
+        flavor = flavors.get(behavior, (231, 95, 137))
+        center = rect.center
+
+        if behavior in ("boss", "cave_boss"):
+            pygame.draw.polygon(
+                screen, (245, 163, 199),
+                [(rect.left + 5, center[1]), (rect.left - 10, rect.top + 10),
+                 (rect.left - 8, rect.bottom - 8), (rect.left + 5, center[1] + 8)],
+            )
+            pygame.draw.polygon(
+                screen, (245, 163, 199),
+                [(rect.right - 5, center[1]), (rect.right + 10, rect.top + 10),
+                 (rect.right + 8, rect.bottom - 8), (rect.right - 5, center[1] + 8)],
+            )
+            pygame.draw.ellipse(screen, (77, 42, 75), rect)
+            pygame.draw.ellipse(screen, flavor, rect.inflate(-10, -12))
+            pygame.draw.arc(screen, (255, 227, 152), rect.inflate(-20, -24), 0.3, 2.8, 4)
+            for dot_x, dot_y in ((-20, -18), (18, -22), (-25, 16), (22, 14), (0, -31)):
+                pygame.draw.circle(screen, (255, 238, 172), (center[0] + dot_x, center[1] + dot_y), 4)
+            pygame.draw.circle(screen, WHITE, (center[0] - 14, center[1] - 2), 8)
+            pygame.draw.circle(screen, WHITE, (center[0] + 14, center[1] - 2), 8)
+            pygame.draw.circle(screen, DARK, (center[0] - 12, center[1] - 1), 3)
+            pygame.draw.circle(screen, DARK, (center[0] + 16, center[1] - 1), 3)
+            bar = pygame.Rect(rect.x + 8, rect.y - 13, rect.width - 16, 8)
+            pygame.draw.rect(screen, DARK, bar)
+            pygame.draw.rect(screen, (92, 207, 123), (bar.x + 2, bar.y + 2, (bar.width - 4) * enemy["health"] // enemy["max_health"], 4))
+            continue
+
+        if behavior == "cave_shooter":
+            can = pygame.Rect(rect.x + 5, rect.y + 2, rect.width - 10, rect.height - 2)
+            pygame.draw.rect(screen, (72, 55, 75), can, border_radius=6)
+            pygame.draw.rect(screen, flavor, (can.x + 2, can.y + 7, can.width - 4, can.height - 13), border_radius=4)
+            pygame.draw.ellipse(screen, (255, 231, 178), (can.x + 7, can.y + 2, can.width - 14, 6))
+            pygame.draw.rect(screen, (255, 231, 178), (can.x + 7, can.y + 10, 4, 3))
+            pygame.draw.circle(screen, WHITE, (center[0] - 4, center[1]), 3)
+            pygame.draw.circle(screen, WHITE, (center[0] + 4, center[1]), 3)
+            pygame.draw.circle(screen, DARK, (center[0] - 3, center[1]), 1)
+            pygame.draw.circle(screen, DARK, (center[0] + 5, center[1]), 1)
+        elif behavior == "ice_spike":
+            stick_top = (center[0], rect.top + 10)
+            pygame.draw.line(screen, (242, 224, 184), (center[0], rect.bottom), stick_top, 4)
+            pygame.draw.circle(screen, (72, 56, 83), stick_top, 17)
+            pygame.draw.circle(screen, flavor, stick_top, 14)
+            pygame.draw.line(screen, WHITE, (stick_top[0] - 8, stick_top[1] + 7), (stick_top[0] + 8, stick_top[1] - 7), 3)
+            pygame.draw.circle(screen, WHITE, (center[0] - 5, center[1] - 7), 2)
+            pygame.draw.circle(screen, WHITE, (center[0] + 5, center[1] - 7), 2)
+        elif behavior == "bat":
+            pygame.draw.polygon(screen, flavor, [(rect.left, center[1]), (rect.left + 6, rect.top), (center[0], rect.top + 7), (rect.right - 6, rect.top), (rect.right, center[1]), (center[0], rect.bottom - 7)])
+            pygame.draw.ellipse(screen, (77, 42, 75), (rect.x + 6, rect.y + 5, rect.width - 12, rect.height - 10))
+            pygame.draw.line(screen, (255, 235, 185), (rect.x + 6, rect.bottom - 6), (rect.right - 6, rect.y + 6), 2)
+            pygame.draw.circle(screen, WHITE, (center[0] - 3, center[1]), 2)
+            pygame.draw.circle(screen, WHITE, (center[0] + 4, center[1]), 2)
+        elif behavior == "mushroom":
+            pygame.draw.polygon(screen, (91, 58, 68), [(rect.left + 6, rect.y + 18), (rect.right - 6, rect.y + 18), (rect.right - 10, rect.bottom), (rect.left + 10, rect.bottom)])
+            pygame.draw.polygon(screen, (245, 212, 170), [(rect.left + 8, rect.y + 18), (rect.right - 8, rect.y + 18), (rect.right - 12, rect.bottom - 2), (rect.left + 12, rect.bottom - 2)])
+            pygame.draw.ellipse(screen, flavor, (rect.x - 3, rect.y + 2, rect.width + 6, 22))
+            for sprinkle_x in (rect.x + 8, center[0], rect.right - 7):
+                pygame.draw.circle(screen, (255, 241, 189), (sprinkle_x, rect.y + 11), 2)
+            pygame.draw.circle(screen, WHITE, (center[0] - 4, center[1] + 4), 2)
+            pygame.draw.circle(screen, WHITE, (center[0] + 4, center[1] + 4), 2)
+        else:
+            body = pygame.Rect(rect.x + 3, rect.y + 3, rect.width - 6, rect.height - 6)
+            pygame.draw.polygon(screen, flavor, [(rect.left, center[1]), (rect.left + 6, rect.top + 3), (body.left, rect.top + 5), (body.right, rect.top + 5), (rect.right - 5, rect.top + 2), (rect.right, center[1]), (rect.right - 5, rect.bottom - 2), (body.right, rect.bottom - 5), (body.left, rect.bottom - 5), (rect.left + 5, rect.bottom - 2)])
+            pygame.draw.ellipse(screen, (77, 42, 75), body)
+            pygame.draw.ellipse(screen, flavor, body.inflate(-4, -4))
+            pygame.draw.ellipse(screen, tuple(min(255, channel + 65) for channel in flavor), (body.x + 4, body.y + 3, max(4, body.width // 3), max(4, body.height // 3)))
+            for dot_x, dot_y in ((-5, -4), (5, -5), (0, 5)):
+                pygame.draw.circle(screen, (255, 239, 175), (center[0] + dot_x, center[1] + dot_y), 2)
+            pygame.draw.circle(screen, WHITE, (center[0] - 4, center[1] + 1), 2)
+            pygame.draw.circle(screen, WHITE, (center[0] + 4, center[1] + 1), 2)
+            pygame.draw.circle(screen, DARK, (center[0] - 3, center[1] + 1), 1)
+            pygame.draw.circle(screen, DARK, (center[0] + 5, center[1] + 1), 1)
+
+        if enemy["max_health"] > 1:
+            bar = pygame.Rect(rect.x, rect.y - 7, rect.width, 5)
+            pygame.draw.rect(screen, DARK, bar)
+            pygame.draw.rect(screen, (92, 207, 123), (bar.x, bar.y, bar.width * enemy["health"] // enemy["max_health"], bar.height))
+        if enemy["hit_timer"] > 0:
+            pygame.draw.rect(screen, WHITE, rect, 2)
+
+
+def draw_player(player, theme, weapon=None, bow_unlocked=False):
+    rect = player.rect
+    facing_right = player.facing > 0
+    walking = player.on_ground and abs(player.vx) > 0.4
+    step = (pygame.time.get_ticks() // 110) % 2 if walking else 0
+    jacket = {
+        "jungle": (46, 139, 83), "snow": (61, 126, 169),
+        "lava": (188, 87, 49), "cave": (119, 105, 154),
+    }[theme]
+    outline = (35, 45, 49)
+    center_x = rect.centerx
+
+    pygame.draw.ellipse(screen, (38, 53, 49), (rect.x + 3, rect.bottom - 5, rect.width - 6, 6))
+    pygame.draw.polygon(
+        screen, (69, 79, 94),
+        [(rect.x + 8, rect.y + 31), (rect.x + 23, rect.y + 31),
+         (rect.x + 24 - step, rect.bottom - 8), (rect.x + 16 - step, rect.bottom - 8),
+         (rect.x + 14, rect.y + 39), (rect.x + 9 + step, rect.bottom - 8),
+         (rect.x + 5 + step, rect.bottom - 8)],
+    )
+    pygame.draw.polygon(
+        screen, outline,
+        [(rect.x + 5 + step, rect.bottom - 9), (rect.x + 15 - step, rect.bottom - 9),
+         (rect.x + 15 - step, rect.bottom - 3), (rect.x + 3 + step, rect.bottom - 3)],
+    )
+    pygame.draw.polygon(
+        screen, (116, 77, 50),
+        [(rect.x + 18 - step, rect.bottom - 9), (rect.x + 27 - step, rect.bottom - 9),
+         (rect.x + 30 - step, rect.bottom - 3), (rect.x + 18 - step, rect.bottom - 3)],
+    )
+    pygame.draw.polygon(
+        screen, outline,
+        [(rect.x + 7, rect.y + 19), (rect.x + 23, rect.y + 19),
+         (rect.x + 26, rect.y + 34), (rect.x + 8, rect.y + 36), (rect.x + 5, rect.y + 27)],
+    )
+    pygame.draw.polygon(
+        screen, jacket,
+        [(rect.x + 9, rect.y + 20), (rect.x + 22, rect.y + 20),
+         (rect.x + 23, rect.y + 32), (rect.x + 9, rect.y + 33)],
+    )
+    pygame.draw.polygon(
+        screen, (142, 91, 54),
+        [(rect.x + (7 if facing_right else 21), rect.y + 22),
+         (rect.x + (11 if facing_right else 25), rect.y + 24),
+         (rect.x + (14 if facing_right else 18), rect.y + 34),
+         (rect.x + (10 if facing_right else 22), rect.y + 33)],
+    )
+    pygame.draw.circle(screen, outline, (center_x, rect.y + 13), 11)
+    pygame.draw.circle(screen, (226, 179, 137), (center_x, rect.y + 13), 8)
+    pygame.draw.polygon(
+        screen, (58, 43, 39),
+        [(center_x - 9, rect.y + 12), (center_x - 7, rect.y + 4),
+         (center_x + 5, rect.y + 3), (center_x + 10, rect.y + 8),
+         (center_x + 7, rect.y + 11), (center_x - 3, rect.y + 9)],
+    )
+    eye_x = center_x + (4 if facing_right else -4)
+    pygame.draw.circle(screen, (249, 246, 225), (eye_x, rect.y + 14), 2)
+    pygame.draw.circle(screen, outline, (eye_x + (1 if facing_right else -1), rect.y + 14), 1)
+    if weapon:
+        hand_x = rect.right - 2 if facing_right else rect.left + 2
+        hand_y = rect.y + 30
+        tip_x = hand_x + (18 if facing_right else -18)
+        tip_y = hand_y - 17
+        pygame.draw.line(screen, (67, 126, 54), (hand_x, hand_y), (tip_x, tip_y), 5)
+        pygame.draw.line(screen, (141, 197, 92), (hand_x, hand_y), (tip_x, tip_y), 2)
+        for offset_x, offset_y, radius in ((-4, -3, 5), (2, -6, 6), (7, -2, 5), (2, 1, 5)):
+            pygame.draw.circle(screen, (61, 153, 72), (tip_x + offset_x, tip_y + offset_y), radius)
+    if bow_unlocked:
+        bow_x = rect.x - 3 if facing_right else rect.right + 3
+        pygame.draw.arc(screen, (76, 134, 57), (bow_x - 8, rect.y + 17, 18, 30), -1.35, 1.35, 3)
+        pygame.draw.line(screen, (172, 207, 123), (bow_x, rect.y + 18), (bow_x, rect.y + 46), 1)
+    if player.blocking:
+        shield_x = rect.right + 1 if facing_right else rect.left - 13
+        shield = pygame.Rect(shield_x, rect.y + 13, 12, 31)
+        pygame.draw.ellipse(screen, (62, 52, 86), shield)
+        pygame.draw.ellipse(screen, (210, 192, 247), shield, 2)
+        pygame.draw.line(screen, (246, 232, 255), shield.midtop, shield.midbottom, 2)
+
+
+def draw_goal(goal, theme):
+    glow = {
+        "jungle": (210, 224, 116), "snow": (144, 226, 255),
+        "lava": (255, 135, 61), "cave": (205, 161, 255),
+    }[theme]
+    pygame.draw.ellipse(screen, glow, goal)
+    pygame.draw.ellipse(screen, (38, 45, 52), goal.inflate(-8, -8))
+    pygame.draw.ellipse(screen, WHITE, goal.inflate(-14, -14), 3)
+    pygame.draw.circle(screen, (255, 247, 190), goal.center, 6)
+
+
+def draw_health(health, text_color=DARK):
+    pygame.draw.rect(screen, DARK, (18, 77, 164, 28), border_radius=5)
+    pygame.draw.rect(screen, WHITE, (22, 81, 156, 20), border_radius=3)
+
+    bar_width = max(0, int(156 * health / 3))
+    if bar_width:
+        pygame.draw.rect(screen, RED, (22, 81, bar_width, 20), border_radius=3)
+
+    screen.blit(font.render(f"Health: {health}/3", True, text_color), (195, 79))
+
+
+def draw_button(rect, label, hovered=False):
+    color = (75, 165, 80) if not hovered else (95, 195, 100)
+    pygame.draw.rect(screen, color, rect, border_radius=10)
+    pygame.draw.rect(screen, WHITE, rect, 3, border_radius=10)
+
+    text = font.render(label, True, WHITE)
+    screen.blit(text, text.get_rect(center=rect.center))
+
+
+def draw_mode_menu():
+    screen.fill((28, 34, 48))
+    pygame.draw.polygon(screen, (45, 93, 73), [(0, 330), (175, 245), (335, 330), (510, 225), (720, 330), (900, 245), (900, 540), (0, 540)])
+    pygame.draw.polygon(screen, (43, 42, 63), [(0, 405), (190, 310), (365, 420), (580, 295), (780, 410), (900, 350), (900, 540), (0, 540)])
+    title = big_font.render("Choose Your Run", True, WHITE)
+    screen.blit(title, title.get_rect(center=(WIDTH // 2, 150)))
+    subtitle = font.render("Pop candy critters with broccoli gear. Collect healthy foods!", True, (201, 211, 221))
+    screen.blit(subtitle, subtitle.get_rect(center=(WIDTH // 2, 202)))
+    normal_hover = normal_button_rect.collidepoint(pygame.mouse.get_pos())
+    hard_hover = hard_button_rect.collidepoint(pygame.mouse.get_pos())
+    draw_button(normal_button_rect, "Normal", normal_hover)
+    draw_button(hard_button_rect, "Hard", hard_hover)
+    screen.blit(small_font.render("20 levels  |  Standard enemy strength", True, WHITE), (normal_button_rect.x - 25, normal_button_rect.bottom + 18))
+    screen.blit(small_font.render("30 levels  |  More threats  |  Final boss", True, WHITE), (hard_button_rect.x - 38, hard_button_rect.bottom + 18))
+    screen.blit(small_font.render("Press 1 or 2 to choose", True, (201, 211, 221)), (WIDTH // 2 - 76, HEIGHT - 34))
+
+
+def level_picker_layout(beaten_levels):
+    levels = sorted(beaten_levels)
+    rows = max(1, (len(levels) + 4) // 5)
+    panel = pygame.Rect(WIDTH - 286, 96, 274, 48 + rows * 34)
+    buttons = []
+    for index, number in enumerate(levels):
+        row, column = divmod(index, 5)
+        rect = pygame.Rect(panel.x + 12 + column * 48, panel.y + 38 + row * 34, 42, 28)
+        buttons.append((number, rect))
+    return panel, buttons
+
+
+def draw_level_picker(beaten_levels, current_level):
+    panel, buttons = level_picker_layout(beaten_levels)
+    pygame.draw.rect(screen, (27, 35, 44), panel, border_radius=6)
+    pygame.draw.rect(screen, (221, 229, 228), panel, 2, border_radius=6)
+    title = small_font.render("Cleared levels", True, WHITE)
+    screen.blit(title, (panel.x + 12, panel.y + 10))
+    for number, rect in buttons:
+        hovered = rect.collidepoint(pygame.mouse.get_pos())
+        color = (69, 119, 89) if number == current_level else (63, 76, 86)
+        if hovered:
+            color = (91, 150, 112)
+        pygame.draw.rect(screen, color, rect, border_radius=4)
+        pygame.draw.rect(screen, WHITE, rect, 1, border_radius=4)
+        label = small_font.render(str(number), True, WHITE)
+        screen.blit(label, label.get_rect(center=rect.center))
+
+
+def select_cleared_level(number):
+    global level_index, player, enemies, objects, hazards, weapon_pickup
+    global projectiles, attack_timer, attack_effect_timer, attack_rect
+    global health, damage_timer, game_state, level_menu_open, food_drops
+
+    if number not in beaten_levels:
+        return
+    level_index = number - 1
+    player, enemies, objects, hazards, weapon_pickup, health, damage_timer = load_level(level_index)
+    projectiles = []
+    food_drops = []
+    attack_timer = 0.0
+    attack_effect_timer = 0.0
+    attack_rect = None
+    level_menu_open = False
+    game_state = "playing"
+
+
+def start_mode(mode):
+    global selected_mode, level_index, player, enemies, objects, hazards
+    global weapon_pickup, weapon, projectiles, attack_timer, attack_effect_timer
+    global attack_rect, health, damage_timer, game_state, LEVELS, bow_unlocked, bow_shoot_timer
+    global beaten_levels, level_menu_open
+    global food_drops, food_score, food_fact, food_fact_timer
+
+    selected_mode = mode
+    LEVELS[:] = generate_hard_campaign() if mode == "hard" else generate_campaign()
+    level_index = 0
+    player, enemies, objects, hazards, weapon_pickup, health, damage_timer = load_level(level_index)
+    weapon = {"name": "Broccoli Club", "damage": 1, "range": 44}
+    bow_unlocked = False
+    bow_shoot_timer = 0.0
+    food_drops = []
+    food_score = 0
+    food_fact = ""
+    food_fact_timer = 0.0
+    beaten_levels = set()
+    level_menu_open = False
+    projectiles = []
+    attack_timer = 0.0
+    attack_effect_timer = 0.0
+    attack_rect = None
+    game_state = "playing"
+
+
+def advance_or_restart():
+    global level_index, player, enemies, objects, hazards, weapon_pickup, projectiles
+    global weapon, attack_timer, attack_effect_timer, attack_rect, health, damage_timer, game_state, selected_mode
+    global bow_unlocked, bow_shoot_timer, beaten_levels, level_menu_open
+    global food_drops, food_score, food_fact, food_fact_timer
+
+    if game_state == "level_complete":
+        beaten_levels.add(LEVELS[level_index]["number"])
+        level_menu_open = False
+        if level_index < len(LEVELS) - 1:
+            level_index += 1
+            player, enemies, objects, hazards, weapon_pickup, health, damage_timer = load_level(level_index)
+            projectiles = []
+            food_drops = []
+            attack_timer = 0.0
+            attack_effect_timer = 0.0
+            attack_rect = None
+            game_state = "playing"
+        else:
+            game_state = "game_complete"
+
+    elif game_state in ("game_complete", "game_over"):
+        if game_state == "game_complete":
+            LEVELS[:] = generate_hard_campaign() if selected_mode == "hard" else generate_campaign()
+            level_index = 0
+            weapon = {"name": "Broccoli Club", "damage": 1, "range": 44}
+            bow_unlocked = False
+            bow_shoot_timer = 0.0
+            beaten_levels = set()
+            level_menu_open = False
+            food_drops = []
+            food_score = 0
+            food_fact = ""
+            food_fact_timer = 0.0
+        player, enemies, objects, hazards, weapon_pickup, health, damage_timer = load_level(level_index)
+        projectiles = []
+        food_drops = []
+        attack_timer = 0.0
+        attack_effect_timer = 0.0
+        attack_rect = None
+        game_state = "playing"
+
+
+level_index = 0
+player, enemies, objects, hazards, weapon_pickup, health, damage_timer = load_level(level_index)
+weapon = {"name": "Broccoli Club", "damage": 1, "range": 44}
+bow_unlocked = False
+bow_shoot_timer = 0.0
+projectiles = []
+food_drops = []
+food_score = 0
+food_fact = ""
+food_fact_timer = 0.0
+attack_timer = 0.0
+attack_effect_timer = 0.0
+attack_rect = None
+selected_mode = None
+beaten_levels = set()
+level_menu_open = False
+game_state = "mode_select"
+running = True
+
+while running:
+    dt = min(clock.tick(60) / 1000.0, 1 / 30)
+    attack_timer = max(0.0, attack_timer - dt)
+    attack_effect_timer = max(0.0, attack_effect_timer - dt)
+    bow_shoot_timer = max(0.0, bow_shoot_timer - dt)
+    food_fact_timer = max(0.0, food_fact_timer - dt)
+    level = LEVELS[level_index]
+    if level["number"] >= 10:
+        bow_unlocked = True
+    platforms = [pygame.Rect(item) for item in level["platforms"]]
+    goal = pygame.Rect(level["goal"])
+    keys = pygame.key.get_pressed()
+
+    for event in pygame.event.get():
+        if event.type == pygame.QUIT:
+            running = False
+
+        elif event.type == pygame.KEYDOWN:
+            if game_state == "mode_select":
+                if event.key in (pygame.K_1, pygame.K_KP1):
+                    start_mode("normal")
+                elif event.key in (pygame.K_2, pygame.K_KP2):
+                    start_mode("hard")
+            elif game_state == "playing":
+                if event.key == pygame.K_ESCAPE and level_menu_open:
+                    level_menu_open = False
+                elif level_menu_open:
+                    pass
+                elif event.key == pygame.K_e:
+                    player.toggle_vine(level["vines"])
+                elif event.key == pygame.K_f and attack_timer == 0:
+                    attack_rect = perform_attack(player, enemies, weapon, food_drops)
+                    attack_timer = 0.32
+                    attack_effect_timer = 0.12
+                elif event.key == pygame.K_g and bow_unlocked and bow_shoot_timer == 0:
+                    shoot_arrow(player, projectiles)
+                    bow_shoot_timer = 0.35
+            elif game_state in ("level_complete", "game_complete", "game_over"):
+                if event.key in (pygame.K_RETURN, pygame.K_SPACE):
+                    advance_or_restart()
+
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 1:
+            if game_state == "mode_select":
+                if normal_button_rect.collidepoint(event.pos):
+                    start_mode("normal")
+                elif hard_button_rect.collidepoint(event.pos):
+                    start_mode("hard")
+            elif game_state in ("level_complete", "game_complete", "game_over"):
+                if button_rect.collidepoint(event.pos):
+                    advance_or_restart()
+            elif game_state == "playing" and beaten_levels:
+                if level_menu_button_rect.collidepoint(event.pos):
+                    level_menu_open = not level_menu_open
+                elif level_menu_open:
+                    panel, buttons = level_picker_layout(beaten_levels)
+                    selected_level = next((number for number, rect in buttons if rect.collidepoint(event.pos)), None)
+                    if selected_level is not None:
+                        select_cleared_level(selected_level)
+                    elif not panel.collidepoint(event.pos):
+                        level_menu_open = False
+
+    if game_state == "mode_select":
+        draw_mode_menu()
+        pygame.display.flip()
+        continue
+
+    if game_state == "playing" and not level_menu_open:
+        collision_solids = platforms + [item["rect"] for item in objects]
+        player.update(dt, keys, collision_solids, level["theme"])
+
+        if weapon_pickup and player.rect.colliderect(weapon_pickup["rect"]):
+            weapon = {key: value for key, value in weapon_pickup.items() if key != "rect"}
+            weapon_pickup = None
+
+        frame = dt * 60
+        update_enemies(enemies, frame, dt)
+        update_projectiles(enemies, projectiles, player, dt, collision_solids, food_drops)
+
+        for drop in food_drops:
+            drop["bob"] += dt * 4
+        collected_food = collect_food_drop(player, food_drops)
+        if collected_food:
+            food_score += 1
+            health = min(3, health + 1)
+            food_fact = FOOD_FACTS[collected_food]
+            food_fact_timer = 5.0
+
+        damage_timer = max(0.0, damage_timer - dt)
+
+        # Falling costs one health and returns the player to the start.
+        if player.rect.top > HEIGHT + 80 and damage_timer == 0:
+            health -= 1
+            damage_timer = 1.0
+
+            if health <= 0:
+                game_state = "game_over"
+            else:
+                player.respawn(level["start"])
+
+        # A forward guard blocks enemy contact and projectiles, but not terrain hazards.
+        if damage_timer == 0:
+            for projectile in projectiles[:]:
+                if player.rect.colliderect(projectile["rect"]):
+                    incoming_direction = 1 if projectile["source_x"] > player.rect.centerx else -1
+                    projectiles.remove(projectile)
+                    if player.blocking and player.facing == incoming_direction:
+                        continue
+                    health -= 1
+                    damage_timer = 1.0
+                    if health <= 0:
+                        game_state = "game_over"
+                    break
+
+        if damage_timer == 0:
+            for enemy in enemies:
+                if player.rect.colliderect(enemy["rect"]):
+                    incoming_direction = 1 if enemy["rect"].centerx > player.rect.centerx else -1
+                    if player.blocking and player.facing == incoming_direction:
+                        break
+                    health -= 1
+                    damage_timer = 1.0
+                    player.attached = False
+                    player.swing_anchor = None
+                    player.vx = -5 if incoming_direction > 0 else 5
+                    player.vy = -7
+                    player.on_ground = False
+                    if health <= 0:
+                        game_state = "game_over"
+                    break
+
+        if damage_timer == 0:
+            for hazard in hazards:
+                if player.rect.colliderect(hazard):
+                    health -= 1
+                    damage_timer = 1.0
+                    player.vx = -5 if player.rect.centerx < hazard.centerx else 5
+                    player.vy = -7
+                    player.on_ground = False
+                    if health <= 0:
+                        game_state = "game_over"
+                    break
+
+        boss_alive = any(enemy.get("behavior", enemy["kind"]) in ("boss", "cave_boss") for enemy in enemies)
+        must_clear_enemies = level.get("kill_required", False) and enemies
+        if game_state == "playing" and not boss_alive and not must_clear_enemies and player.rect.colliderect(goal):
+            beaten_levels.add(level["number"])
+            game_state = "level_complete"
+
+    # Draw the level.
+    draw_background(level["theme"], level)
+    draw_platforms(platforms, level["theme"])
+    draw_objects(objects)
+    draw_food_drops(food_drops)
+    draw_hazards(hazards, level["theme"])
+    draw_vines(
+        level["vines"],
+        player.attached,
+        player.swing_anchor,
+        player.swing_angle,
+    )
+    draw_enemies(enemies)
+    draw_projectiles(projectiles)
+
+    draw_goal(goal, level["theme"])
+    if weapon_pickup:
+        draw_weapon_pickup(weapon_pickup)
+
+    if damage_timer == 0 or int(damage_timer * 10) % 2 == 0:
+        draw_player(player, level["theme"], weapon, bow_unlocked)
+    if attack_effect_timer > 0 and attack_rect:
+        draw_attack_effect(attack_rect, level["theme"])
+
+    ui_color = WHITE if level["theme"] in ("lava", "cave") else DARK
+    screen.blit(
+        font.render(f"Level {level_index + 1}: {level['name']}", True, ui_color),
+        (18, 16),
+    )
+    feature_text = small_font.render(f"New: {level['feature']}", True, ui_color)
+    screen.blit(feature_text, (WIDTH - feature_text.get_width() - 18, 18))
+
+    controls = "W/A/S/D: Move/Jump/Drop   F: Broccoli swing   Shift: Block"
+    if level["theme"] == "jungle":
+        controls += "   E: Vine"
+    elif level["theme"] == "snow":
+        controls += "   Ice is slippery"
+    elif level["theme"] == "cave":
+        controls += "   Cave sentries fire bolts"
+    else:
+        controls += "   Dodge lava"
+    screen.blit(small_font.render(controls, True, ui_color), (18, 48))
+    draw_health(health, ui_color)
+    weapon_name = weapon["name"] if weapon else "Fists"
+    screen.blit(small_font.render(f"Weapon: {weapon_name}", True, ui_color), (18, 108))
+    screen.blit(small_font.render(f"Healthy foods found: {food_score}", True, ui_color), (18, 130))
+    bow_status = "Bow: G to shoot" if bow_unlocked else "Bow unlocks at level 10"
+    screen.blit(small_font.render(bow_status, True, ui_color), (18, 152))
+    if level.get("kill_required", False) and enemies:
+        clear_text = small_font.render(f"Clear enemies: {len(enemies)} left", True, ui_color)
+        screen.blit(clear_text, (18, 174))
+    if food_fact_timer > 0 and food_fact:
+        fact_surface = small_font.render(food_fact, True, WHITE)
+        fact_panel = pygame.Surface((WIDTH - 24, 34), pygame.SRCALPHA)
+        fact_panel.fill((22, 38, 42, 215))
+        screen.blit(fact_panel, (12, HEIGHT - 44))
+        screen.blit(fact_surface, (22, HEIGHT - 35))
+    if game_state == "playing" and beaten_levels:
+        hovered = level_menu_button_rect.collidepoint(pygame.mouse.get_pos())
+        pygame.draw.rect(screen, (71, 105, 89) if not hovered else (91, 139, 111), level_menu_button_rect, border_radius=4)
+        pygame.draw.rect(screen, WHITE, level_menu_button_rect, 1, border_radius=4)
+        menu_label = small_font.render("Levels", True, WHITE)
+        screen.blit(menu_label, menu_label.get_rect(center=level_menu_button_rect.center))
+        if level_menu_open:
+            draw_level_picker(beaten_levels, level["number"])
+    if any(enemy.get("behavior", enemy["kind"]) in ("boss", "cave_boss") for enemy in enemies):
+        boss_hint = small_font.render("Defeat the Titan to unlock the gate", True, WHITE)
+        screen.blit(boss_hint, boss_hint.get_rect(center=(WIDTH // 2, 82)))
+
+    # Completion and retry screens.
+    if game_state in ("level_complete", "game_complete", "game_over"):
+        overlay = pygame.Surface((WIDTH, HEIGHT), pygame.SRCALPHA)
+        overlay.fill((10, 25, 35, 165))
+        screen.blit(overlay, (0, 0))
+
+        if game_state == "level_complete":
+            title = "Level Complete!"
+            label = "Next Level" if level_index < len(LEVELS) - 1 else "Finish Game"
+        elif game_state == "game_complete":
+            title = "You Completed the Game!"
+            label = "Play Again"
+        else:
+            title = "Game Over"
+            label = "Retry Level"
+
+        title_surface = big_font.render(title, True, WHITE)
+        screen.blit(
+            title_surface,
+            title_surface.get_rect(center=(WIDTH // 2, HEIGHT // 2 - 35)),
+        )
+
+        draw_button(
+            button_rect,
+            label,
+            button_rect.collidepoint(pygame.mouse.get_pos()),
+        )
+
+        hint = small_font.render("Click the button or press Enter", True, WHITE)
+        screen.blit(
+            hint,
+            hint.get_rect(center=(WIDTH // 2, HEIGHT // 2 + 120)),
+        )
+
+    pygame.display.flip()
+
+pygame.quit()
