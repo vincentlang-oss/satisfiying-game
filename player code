@@ -1,0 +1,157 @@
+import math
+import pygame
+
+
+PLAYER_SIZE = (32, 48)
+GRAVITY = 0.62
+JUMP_SPEED = -13
+MAX_FALL_SPEED = 14
+VINE_LENGTH = 135
+SCREEN_WIDTH = 900
+
+
+class Player:
+    def __init__(self, start):
+        self.rect = pygame.Rect(start[0], start[1], *PLAYER_SIZE)
+        self.vx = 0.0
+        self.vy = 0.0
+        self.facing = 1
+        self.blocking = False
+        self.on_ground = False
+
+        self.attached = False
+        self.swing_anchor = None
+        self.swing_angle = 0.0
+        self.swing_speed = 0.0
+
+    def respawn(self, start):
+        self.rect.topleft = start
+        self.vx = 0.0
+        self.vy = 0.0
+        self.facing = 1
+        self.blocking = False
+        self.on_ground = False
+        self.attached = False
+        self.swing_anchor = None
+        self.swing_speed = 0.0
+
+    def toggle_vine(self, vines):
+        """Grab the nearest vine, or release the vine currently being held."""
+        if self.attached:
+            self.attached = False
+            self.swing_anchor = None
+
+            # Carry some of the swing's movement into the jump.
+            self.vx = math.cos(self.swing_angle) * VINE_LENGTH * self.swing_speed
+            self.vy = -math.sin(self.swing_angle) * VINE_LENGTH * self.swing_speed - 1
+            return
+
+        nearest_vine = None
+        nearest_distance = 185
+
+        for anchor in vines:
+            distance = math.hypot(
+                self.rect.centerx - anchor[0],
+                self.rect.centery - anchor[1],
+            )
+            if distance < nearest_distance:
+                nearest_vine = anchor
+                nearest_distance = distance
+
+        if nearest_vine is not None:
+            self.attached = True
+            self.swing_anchor = nearest_vine
+            dx = self.rect.centerx - nearest_vine[0]
+            dy = self.rect.centery - nearest_vine[1]
+            self.swing_angle = math.atan2(dx, dy)
+            self.swing_speed = 0.0
+
+    def update(self, dt, keys, platforms, theme):
+        # Use 60 FPS as the reference speed while allowing other frame rates.
+        frame = dt * 60
+        self.blocking = bool(keys[pygame.K_s] or keys[pygame.K_LSHIFT] or keys[pygame.K_RSHIFT])
+
+        if self.attached:
+            direction = int(keys[pygame.K_RIGHT]) - int(keys[pygame.K_LEFT])
+            if direction:
+                self.facing = direction
+
+            self.swing_speed += (
+                -GRAVITY / VINE_LENGTH * math.sin(self.swing_angle)
+                + direction * 0.02
+            ) * frame
+            self.swing_speed *= 0.995 ** frame
+            self.swing_angle += self.swing_speed * frame
+
+            anchor_x, anchor_y = self.swing_anchor
+            self.rect.center = (
+                round(anchor_x + math.sin(self.swing_angle) * VINE_LENGTH),
+                round(anchor_y + math.cos(self.swing_angle) * VINE_LENGTH),
+            )
+            self.on_ground = False
+            return
+
+        # Snow has lower acceleration and much less friction, so it is slippery.
+        if theme == "snow":
+            acceleration = 0.34
+            friction = 0.985
+            max_speed = 6.5
+        else:
+            acceleration = 0.72
+            friction = 0.82
+            max_speed = 5.5
+
+        if self.blocking:
+            acceleration *= 0.35
+            max_speed *= 0.45
+
+        direction = int(keys[pygame.K_RIGHT]) - int(keys[pygame.K_LEFT])
+        if direction:
+            self.facing = direction
+        self.vx += direction * acceleration * frame
+
+        if direction == 0:
+            self.vx *= friction ** frame
+
+        self.vx = max(-max_speed, min(max_speed, self.vx))
+
+        # Horizontal movement and wall/platform collision.
+        self.rect.x += round(self.vx * frame)
+
+        for platform in platforms:
+            if self.rect.colliderect(platform):
+                if self.vx > 0:
+                    self.rect.right = platform.left
+                elif self.vx < 0:
+                    self.rect.left = platform.right
+                self.vx = 0.0
+
+        # Jumping and falling.
+        if keys[pygame.K_UP] and self.on_ground:
+            self.vy = JUMP_SPEED
+            self.on_ground = False
+
+        if keys[pygame.K_DOWN]:
+            self.vy += 0.35 * frame
+
+        self.vy = min(self.vy + GRAVITY * frame, MAX_FALL_SPEED)
+        self.rect.y += round(self.vy * frame)
+        self.on_ground = False
+
+        # Vertical platform collision.
+        for platform in platforms:
+            if self.rect.colliderect(platform):
+                if self.vy > 0:
+                    self.rect.bottom = platform.top
+                    self.on_ground = True
+                elif self.vy < 0:
+                    self.rect.top = platform.bottom
+                self.vy = 0.0
+
+        # Keep the player within the screen's side edges.
+        if self.rect.left < 0:
+            self.rect.left = 0
+            self.vx = 0.0
+        elif self.rect.right > SCREEN_WIDTH:
+            self.rect.right = SCREEN_WIDTH
+            self.vx = 0.0
