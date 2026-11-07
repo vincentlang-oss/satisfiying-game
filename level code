@@ -1,0 +1,419 @@
+import copy
+
+
+BIOMES = ("jungle", "snow", "cave", "lava")
+LEVEL_COUNT = 20
+
+
+def _object(kind, rect):
+    return {"kind": kind, "rect": rect}
+
+
+def _enemy(kind, rect, left, right, speed, amplitude=0, health=1, shoot_cooldown=None):
+    enemy = {
+        "kind": kind,
+        "rect": rect,
+        "left": left,
+        "right": right,
+        "speed": speed,
+        "amplitude": amplitude,
+        "health": health,
+    }
+    if shoot_cooldown is not None:
+        enemy["shoot_cooldown"] = shoot_cooldown
+    return enemy
+
+
+def _level(number, name, theme, feature, platforms, objects=(), hazards=(), enemies=(), vines=(), start=(40, 452), weapon_pickup=None, kill_required=False):
+    raised_platforms = tuple(
+        (x, 420 if y >= 460 and width <= 80 and height <= 40 else y, width, height)
+        for x, y, width, height in platforms
+    )
+    raised_objects = []
+    for item in objects:
+        x, y, width, height = item["rect"]
+        if y + height > 450:
+            y = min(y, 420 - height)
+        raised_objects.append(_object(item["kind"], (x, y, width, height)))
+    raised_hazards = tuple(
+        (x, 420 if y >= 460 else y, width, height)
+        for x, y, width, height in hazards
+    )
+    return {
+        "number": number,
+        "name": name,
+        "theme": theme,
+        "feature": feature,
+        "difficulty": number,
+        "start": start,
+        "goal": (835, 435, 40, 65),
+        "platforms": raised_platforms,
+        "objects": raised_objects,
+        "hazards": list(raised_hazards),
+        "vines": list(vines),
+        "enemies": list(enemies),
+        "weapon_pickup": weapon_pickup,
+        "kill_required": kill_required,
+    }
+
+
+def generate_campaign():
+    return [
+        _level(
+            1, "Jungle Canopy", "jungle", "vine and jump practice",
+            (
+                (0, 500, 900, 40), (130, 410, 145, 20), (345, 350, 130, 20),
+                (555, 300, 140, 20), (735, 390, 125, 20), (295, 465, 30, 35),
+            ),
+            enemies=(_enemy("slime", (220, 470, 30, 30), 160, 300, 1.0),),
+            vines=((300, 155), (510, 145)),
+            start=(40, 420),
+        ),
+        _level(
+            2, "Frozen Ridge", "snow", "snowball patrols",
+            (
+                (0, 500, 900, 40), (120, 420, 160, 20), (330, 350, 145, 20),
+                (535, 285, 155, 20), (740, 390, 120, 20), (290, 465, 35, 35),
+            ),
+            enemies=(
+                _enemy("snowball", (170, 470, 30, 30), 120, 280, 1.15),
+                _enemy("hopper", (430, 320, 30, 30), 345, 500, 1.25, 16),
+            ),
+            start=(40, 420),
+        ),
+        _level(
+            3, "Deep Jungle", "jungle", "three patrolling slimes",
+            (
+                (0, 500, 900, 40), (115, 405, 130, 20), (300, 330, 125, 20),
+                (510, 390, 130, 20), (700, 300, 150, 20), (415, 465, 35, 35),
+            ),
+            enemies=(
+                _enemy("slime", (190, 470, 30, 30), 130, 260, 1.3),
+                _enemy("slime", (350, 300, 30, 30), 300, 460, 1.4),
+                _enemy("slime", (640, 270, 30, 30), 565, 740, 1.45),
+            ),
+            vines=((265, 150), (475, 145), (670, 155)),
+            start=(40, 420),
+        ),
+        _level(
+            4, "Glacier Pass", "snow", "hoppers and ice ledges",
+            (
+                (0, 500, 900, 40), (110, 415, 150, 20), (310, 335, 145, 20),
+                (510, 400, 150, 20), (710, 315, 150, 20), (425, 465, 35, 35),
+            ),
+            enemies=(
+                _enemy("snowball", (150, 470, 30, 30), 110, 260, 1.6),
+                _enemy("hopper", (388, 305, 30, 30), 330, 530, 1.65, 20),
+                _enemy("snowball", (685, 285, 30, 30), 710, 820, 1.7),
+            ),
+            start=(40, 420),
+        ),
+        _level(
+            5, "Fallen Log Run", "jungle", "first thorn pits and slimes",
+            (
+                (0, 500, 270, 40), (355, 500, 220, 40), (675, 500, 225, 40),
+                (135, 430, 130, 18), (285, 385, 135, 18),
+                (445, 430, 135, 18), (625, 385, 130, 18),
+            ),
+            objects=(_object("log", (205, 465, 52, 35)), _object("crate", (535, 466, 34, 34))),
+            hazards=((270, 486, 85, 14), (575, 486, 100, 14)),
+            enemies=(_enemy("slime", (390, 470, 30, 30), 365, 530, 1.8),),
+        ),
+        _level(
+            6, "Vine Swing Crossing", "jungle", "swing across wide gaps",
+            (
+                (0, 500, 245, 40), (350, 500, 190, 40), (655, 500, 245, 40),
+                (170, 430, 140, 18), (300, 390, 135, 18),
+                (465, 430, 140, 18), (600, 390, 130, 18),
+            ),
+            hazards=((245, 486, 105, 14), (540, 486, 115, 14)),
+            enemies=(_enemy("hopper", (400, 395, 30, 30), 365, 500, 1.9, 22),),
+            vines=((300, 220), (590, 215)),
+        ),
+        _level(
+            7, "Thorn Canopy", "jungle", "hoppers and narrow footholds",
+            (
+                (0, 500, 230, 40), (345, 500, 190, 40), (650, 500, 250, 40),
+                (155, 430, 130, 18), (275, 385, 130, 18),
+                (440, 430, 135, 18), (565, 380, 135, 18), (700, 430, 125, 18),
+            ),
+            objects=(_object("tree", (390, 430, 30, 70)),),
+            hazards=((230, 486, 115, 14), (535, 486, 115, 14)),
+            enemies=(
+                _enemy("slime", (370, 470, 30, 30), 350, 505, 1.9),
+                _enemy("hopper", (590, 350, 30, 30), 570, 665, 2.0, 25),
+            ),
+            vines=((305, 205),),
+        ),
+        _level(
+            8, "Canopy Gauntlet", "jungle", "thorn beds and flying bats",
+            (
+                (0, 500, 205, 40), (330, 500, 175, 40), (610, 500, 290, 40),
+                (120, 430, 130, 18), (240, 380, 130, 18),
+                (390, 425, 130, 18), (510, 375, 130, 18), (680, 425, 125, 18),
+            ),
+            hazards=((205, 486, 125, 14), (505, 486, 105, 14)),
+            enemies=(
+                _enemy("slime", (350, 470, 30, 30), 335, 465, 2.0),
+                _enemy("hopper", (535, 345, 30, 30), 515, 600, 2.1, 26),
+                _enemy("bat", (700, 305, 36, 24), 660, 800, 2.1, 30),
+            ),
+            vines=((245, 205), (605, 200)),
+        ),
+        _level(
+            9, "Icefall Bridge", "snow", "slippery ice and snowballs",
+            (
+                (0, 500, 230, 40), (335, 500, 170, 40), (610, 500, 290, 40),
+                (145, 425, 135, 18), (265, 380, 135, 18),
+                (435, 425, 135, 18), (545, 380, 135, 18), (690, 425, 135, 18),
+            ),
+            objects=(_object("ice", (380, 462, 35, 38)),),
+            hazards=((230, 486, 105, 14), (505, 486, 105, 14)),
+            enemies=(
+                _enemy("snowball", (355, 470, 30, 30), 340, 475, 2.1),
+                _enemy("hopper", (565, 350, 30, 30), 550, 645, 2.1, 24),
+            ),
+        ),
+        _level(
+            10, "Whiteout Pass", "snow", "flying ice bats",
+            (
+                (0, 500, 205, 40), (325, 500, 180, 40), (625, 500, 275, 40),
+                (120, 430, 130, 18), (245, 380, 130, 18),
+                (410, 425, 130, 18), (525, 375, 130, 18), (690, 425, 130, 18),
+            ),
+            objects=(_object("ice", (350, 462, 36, 38)), _object("ice_pillar", (555, 320, 28, 55))),
+            hazards=((205, 486, 120, 14), (505, 486, 120, 14)),
+            enemies=(
+                _enemy("snowball", (350, 470, 30, 30), 335, 465, 2.2),
+                _enemy("hopper", (430, 395, 30, 30), 415, 500, 2.2, 25),
+                _enemy("bat", (560, 315, 36, 24), 535, 690, 2.3, 28),
+            ),
+        ),
+        _level(
+            11, "Glacier Gauntlet", "snow", "three spike pits and ice blocks",
+            (
+                (0, 500, 190, 40), (315, 500, 165, 40), (590, 500, 310, 40),
+                (110, 430, 130, 18), (230, 380, 130, 18),
+                (390, 430, 130, 18), (505, 375, 130, 18), (660, 425, 135, 18),
+            ),
+            objects=(_object("ice_pillar", (360, 430, 30, 70)), _object("ice", (690, 462, 36, 38))),
+            hazards=((190, 486, 125, 14), (350, 486, 40, 14), (480, 486, 110, 14)),
+            enemies=(
+                _enemy("snowball", (340, 470, 30, 30), 330, 455, 2.3),
+                _enemy("hopper", (535, 345, 30, 30), 515, 600, 2.4, 27),
+                _enemy("bat", (700, 305, 36, 24), 660, 800, 2.4, 30),
+            ),
+        ),
+        _level(
+            12, "Avalanche Crown", "snow", "armored snowballs and tighter jumps",
+            (
+                (0, 500, 180, 40), (305, 500, 155, 40), (565, 500, 135, 40), (810, 500, 90, 40),
+                (100, 430, 125, 18), (215, 380, 125, 18),
+                (350, 425, 125, 18), (465, 375, 125, 18), (600, 420, 125, 18), (710, 370, 110, 18),
+            ),
+            objects=(_object("ice_pillar", (385, 430, 30, 70)),),
+            hazards=((180, 486, 125, 14), (460, 486, 105, 14), (700, 486, 110, 14)),
+            enemies=(
+                _enemy("snowball", (330, 470, 30, 30), 315, 440, 2.5, health=2),
+                _enemy("hopper", (500, 345, 30, 30), 480, 580, 2.5, 28),
+                _enemy("bat", (655, 310, 36, 24), 625, 780, 2.6, 32),
+            ),
+        ),
+        _level(
+            13, "Cave Mouth", "cave", "raised stalactites and cave spitters",
+            (
+                (0, 500, 900, 40), (120, 430, 130, 18), (310, 390, 130, 18),
+                (500, 430, 130, 18), (710, 380, 130, 18),
+            ),
+            objects=(_object("cave_block", (270, 350, 42, 70)),),
+            hazards=((280, 365, 46, 16), (605, 385, 54, 16)),
+            enemies=(
+                _enemy("cave_shooter", (570, 340, 36, 36), 550, 690, 1.1, 10, shoot_cooldown=2.3),
+            ),
+        ),
+        _level(
+            14, "Echo Chamber", "cave", "aimed cave bolts and hanging rock",
+            (
+                (0, 500, 900, 40), (100, 430, 130, 18), (250, 385, 130, 18),
+                (430, 430, 130, 18), (585, 380, 130, 18),
+            ),
+            objects=(_object("stalactite", (330, 330, 48, 80)), _object("cave_block", (660, 350, 42, 70))),
+            hazards=((210, 370, 50, 16), (520, 365, 55, 16)),
+            enemies=(
+                _enemy("cave_shooter", (365, 345, 36, 36), 340, 470, 1.3, 14, shoot_cooldown=2.0),
+                _enemy("bat", (640, 320, 36, 24), 610, 770, 2.8, 24),
+            ),
+        ),
+        _level(
+            15, "Crystal Armory", "cave", "weapon: thorn gauntlet",
+            ((0, 500, 900, 40),),
+            objects=(_object("cave_block", (255, 360, 42, 70)), _object("crystal", (640, 380, 30, 40))),
+            hazards=((390, 370, 56, 16), (735, 385, 62, 16)),
+            enemies=(
+                _enemy("mushroom", (505, 470, 34, 30), 475, 600, 2.9, health=2),
+                _enemy("cave_shooter", (760, 340, 36, 36), 740, 840, 1.4, 12, health=2, shoot_cooldown=1.8),
+            ),
+            weapon_pickup={"name": "Thorn Gauntlet", "damage": 2, "range": 58, "rect": (390, 448, 28, 40)},
+        ),
+        _level(
+            16, "Falling Stalactites", "cave", "ceiling hazards and guarded passages",
+            ((0, 500, 900, 40), (115, 425, 140, 18), (350, 390, 140, 18), (590, 425, 140, 18)),
+            objects=(_object("stalactite", (285, 325, 48, 82)), _object("cave_block", (520, 350, 42, 70))),
+            hazards=((265, 365, 50, 16), (535, 380, 50, 16), (770, 370, 60, 16)),
+            enemies=(
+                _enemy("cave_shooter", (435, 335, 36, 36), 410, 550, 1.5, 16, shoot_cooldown=1.7),
+                _enemy("bat", (700, 345, 36, 24), 675, 810, 3.0, 28),
+            ),
+        ),
+        _level(
+            17, "Deep Hollow", "cave", "crossfire from twin cave sentries",
+            ((0, 500, 900, 40), (100, 430, 130, 18), (295, 385, 130, 18), (500, 430, 130, 18), (700, 385, 135, 18)),
+            objects=(_object("cave_block", (235, 350, 42, 70)), _object("stalactite", (590, 310, 48, 82))),
+            hazards=((260, 370, 50, 16), (650, 360, 55, 16)),
+            enemies=(
+                _enemy("cave_shooter", (380, 340, 36, 36), 350, 470, 1.7, 18, health=2, shoot_cooldown=1.6),
+                _enemy("cave_shooter", (735, 340, 36, 36), 710, 825, 1.8, 16, health=2, shoot_cooldown=1.45),
+                _enemy("bat", (600, 330, 36, 24), 580, 750, 3.1, 32),
+            ),
+        ),
+        _level(
+            18, "Ember Arsenal", "lava", "weapon upgrade: ember blade",
+            ((0, 500, 900, 40),),
+            objects=(_object("basalt", (280, 462, 36, 38)), _object("crystal", (650, 390, 30, 40))),
+            hazards=((400, 486, 68, 14), (735, 486, 70, 14)),
+            enemies=(
+                _enemy("firebug", (500, 470, 30, 30), 470, 615, 3.2, health=2),
+                _enemy("firefly", (765, 390, 28, 24), 735, 860, 3.2, 28),
+            ),
+            weapon_pickup={"name": "Ember Blade", "damage": 4, "range": 82, "rect": (355, 446, 30, 42)},
+        ),
+        _level(
+            19, "Siege of the Crater", "lava", "elite guards protect the summit",
+            ((0, 500, 900, 40),),
+            objects=(_object("basalt", (260, 462, 36, 38)), _object("crystal", (500, 390, 30, 40)), _object("basalt", (735, 462, 36, 38))),
+            hazards=((390, 486, 70, 14), (610, 486, 74, 14)),
+            enemies=(
+                _enemy("firebug", (430, 470, 30, 30), 405, 555, 3.3, health=3),
+                _enemy("firefly", (650, 365, 28, 24), 620, 760, 3.4, 32, health=2),
+                _enemy("bat", (815, 340, 36, 24), 780, 865, 3.4, 25, health=2),
+            ),
+        ),
+        _level(
+            20, "Cinder Titan", "lava", "boss: defeat the titan to open the gate",
+            ((0, 500, 900, 40),),
+            objects=(_object("basalt", (310, 462, 36, 38)), _object("crystal", (540, 390, 30, 40))),
+            hazards=((435, 486, 72, 14),),
+            enemies=(_enemy("boss", (700, 408, 88, 92), 620, 805, 1.6, health=16),),
+        ),
+    ]
+
+
+def generate_hard_campaign():
+    levels = copy.deepcopy(generate_campaign())
+    kill_gate_levels = {5, 8, 11, 14, 17, 20}
+
+    for level in levels:
+        number = level["number"]
+        level["name"] = "Hard " + level["name"]
+        level["difficulty"] = number + 10
+        level["kill_required"] = number in kill_gate_levels
+
+        for enemy in level["enemies"]:
+            enemy["speed"] = (1 if enemy["speed"] >= 0 else -1) * (abs(enemy["speed"]) + 0.35)
+
+        if level["theme"] == "jungle":
+            bonus = _enemy("slime", (805, 470, 30, 30), 760, 870, 2.0 + number * 0.025, health=2 if number > 10 else 1)
+        elif level["theme"] == "snow":
+            bonus = _enemy("ice_spike", (790, 445, 30, 42), 770, 850, 0, health=2 if number > 10 else 1)
+        elif level["theme"] == "cave":
+            bonus = _enemy("cave_shooter", (790, 340, 36, 36), 760, 845, 1.5, 12, health=2, shoot_cooldown=1.5)
+        else:
+            bonus = _enemy("firebug", (805, 470, 30, 30), 770, 870, 2.2 + number * 0.025, health=2 if number > 10 else 1)
+        level["enemies"].append(bonus)
+
+    hard_stages = [
+        _level(
+            21, "Bramble Gauntlet", "jungle", "hard: double patrols and high thorns",
+            ((0, 500, 205, 40), (330, 500, 170, 40), (620, 500, 280, 40),
+             (110, 425, 125, 18), (235, 375, 130, 18), (390, 425, 130, 18), (530, 375, 130, 18), (690, 425, 130, 18)),
+            hazards=((205, 360, 48, 16), (500, 340, 48, 16)),
+            enemies=(_enemy("hopper", (360, 395, 30, 30), 340, 490, 3.2, 35), _enemy("slime", (700, 470, 30, 30), 670, 820, 3.0, health=3)),
+            vines=((270, 205), (590, 190)),
+        ),
+        _level(
+            22, "Whiteout Crossfire", "snow", "hard: ice spike foes and bats",
+            ((0, 500, 900, 40), (105, 420, 120, 18), (250, 375, 120, 18), (405, 425, 120, 18), (565, 370, 120, 18), (720, 425, 120, 18)),
+            hazards=((200, 345, 46, 16), (480, 325, 50, 16)),
+            enemies=(_enemy("ice_spike", (280, 390, 28, 42), 260, 340, 0, health=3), _enemy("bat", (560, 310, 36, 24), 520, 680, 3.3, 32), _enemy("snowball", (750, 470, 30, 30), 720, 850, 3.2, health=2)),
+            kill_required=True,
+        ),
+        _level(
+            23, "Crystal Barrage", "cave", "hard: two sentries fire in volleys",
+            ((0, 500, 900, 40), (100, 430, 125, 18), (255, 380, 125, 18), (425, 430, 125, 18), (585, 380, 125, 18), (745, 430, 120, 18)),
+            objects=(_object("cave_block", (345, 345, 42, 70)), _object("stalactite", (650, 310, 48, 80))),
+            hazards=((225, 350, 48, 16), (515, 340, 48, 16)),
+            enemies=(_enemy("cave_shooter", (350, 330, 36, 36), 330, 475, 2.0, 18, health=3, shoot_cooldown=1.1), _enemy("cave_shooter", (700, 330, 36, 36), 675, 820, 2.1, 16, health=3, shoot_cooldown=1.0)),
+        ),
+        _level(
+            24, "Molten Stairfall", "lava", "hard: timed jumps and firebug pack",
+            ((0, 500, 185, 40), (300, 500, 160, 40), (570, 500, 125, 40), (805, 500, 95, 40),
+             (100, 425, 120, 18), (220, 370, 120, 18), (365, 420, 120, 18), (475, 365, 120, 18), (620, 420, 120, 18), (735, 365, 120, 18)),
+            hazards=((185, 340, 48, 16), (460, 330, 48, 16)),
+            enemies=(_enemy("firebug", (330, 470, 30, 30), 310, 430, 3.4, health=3), _enemy("firefly", (530, 310, 28, 24), 500, 665, 3.5, 30), _enemy("bat", (750, 320, 36, 24), 720, 850, 3.5, 28)),
+            kill_required=True,
+        ),
+        _level(
+            25, "Frostbite Switchbacks", "snow", "hard: narrow ledges and ice spikes",
+            ((0, 500, 190, 40), (315, 500, 155, 40), (590, 500, 310, 40), (100, 425, 115, 18), (215, 370, 120, 18), (370, 420, 120, 18), (495, 365, 120, 18), (665, 420, 125, 18)),
+            hazards=((235, 330, 48, 16), (520, 325, 50, 16), (755, 350, 48, 16)),
+            enemies=(_enemy("ice_spike", (350, 390, 28, 42), 330, 405, 0, health=3), _enemy("snowball", (620, 470, 30, 30), 600, 760, 3.6, health=3), _enemy("bat", (740, 330, 36, 24), 715, 850, 3.5, 32)),
+        ),
+        _level(
+            26, "Rootbound Arena", "jungle", "hard: armored hoppers guard the path",
+            ((0, 500, 900, 40),),
+            objects=(_object("tree", (260, 420, 32, 80)), _object("crate", (550, 385, 38, 38)), _object("log", (700, 420, 60, 35))),
+            hazards=((400, 345, 52, 16), (620, 325, 52, 16)),
+            enemies=(_enemy("hopper", (360, 400, 30, 30), 340, 500, 3.5, 34, health=3), _enemy("slime", (680, 470, 30, 30), 650, 810, 3.6, health=3), _enemy("bat", (790, 330, 36, 24), 760, 865, 3.6, 25)),
+        ),
+        _level(
+            27, "Echo Killhouse", "cave", "hard: clear every sentry to open the exit",
+            ((0, 500, 900, 40), (105, 425, 125, 18), (265, 375, 125, 18), (435, 425, 125, 18), (600, 375, 125, 18)),
+            objects=(_object("cave_block", (245, 345, 42, 70)), _object("stalactite", (545, 300, 48, 82))),
+            hazards=((215, 330, 50, 16), (515, 325, 50, 16)),
+            enemies=(_enemy("cave_shooter", (340, 325, 36, 36), 320, 465, 2.2, 18, health=4, shoot_cooldown=0.9), _enemy("cave_shooter", (680, 325, 36, 36), 650, 820, 2.4, 20, health=4, shoot_cooldown=0.85)),
+            kill_required=True,
+        ),
+        _level(
+            28, "Cinder Crossfire", "lava", "hard: fireflies shoot from both sides",
+            ((0, 500, 900, 40), (100, 425, 120, 18), (235, 370, 120, 18), (390, 420, 120, 18), (525, 365, 120, 18), (690, 420, 120, 18)),
+            hazards=((205, 335, 48, 16), (490, 325, 48, 16), (740, 345, 48, 16)),
+            enemies=(_enemy("firebug", (320, 470, 30, 30), 300, 450, 3.7, health=4), _enemy("firefly", (510, 305, 28, 24), 480, 650, 3.8, 36), _enemy("bat", (740, 325, 36, 24), 710, 850, 3.8, 32)),
+        ),
+        _level(
+            29, "The Last Sentries", "cave", "hard: kill the guards before the gate",
+            ((0, 500, 900, 40), (90, 425, 120, 18), (235, 375, 120, 18), (400, 425, 120, 18), (555, 375, 120, 18), (720, 425, 120, 18)),
+            objects=(_object("cave_block", (360, 345, 42, 70)), _object("stalactite", (635, 290, 48, 82))),
+            hazards=((205, 330, 50, 16), (510, 325, 50, 16), (680, 345, 50, 16)),
+            enemies=(_enemy("cave_shooter", (350, 325, 36, 36), 330, 470, 2.6, 22, health=5, shoot_cooldown=0.75), _enemy("cave_shooter", (700, 325, 36, 36), 680, 840, 2.8, 20, health=5, shoot_cooldown=0.7), _enemy("bat", (530, 300, 36, 24), 500, 670, 4.0, 36, health=3)),
+            kill_required=True,
+        ),
+        _level(
+            30, "Abyssal Warden", "cave", "final boss: block volleys and strike between bursts",
+            ((0, 500, 900, 40), (110, 430, 125, 18), (335, 400, 125, 18), (605, 430, 125, 18)),
+            objects=(_object("cave_block", (270, 350, 42, 70)), _object("stalactite", (550, 275, 48, 82))),
+            hazards=((420, 350, 60, 16), (740, 335, 56, 16)),
+            enemies=(_enemy("cave_boss", (690, 390, 104, 110), 610, 800, 1.8, 14, health=36, shoot_cooldown=0.8),),
+            kill_required=True,
+        ),
+    ]
+
+    for level in hard_stages:
+        if level["theme"] == "cave":
+            level["kill_required"] = level["number"] in (27, 29, 30)
+        if level["number"] == 30:
+            level["boss_volley"] = True
+
+    return levels + hard_stages
+
+
+LEVELS = generate_campaign()
